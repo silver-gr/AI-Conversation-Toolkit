@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Create an index of Research conversations from ChatGPT, Claude, and Gemini exports.
-Detects Deep Research (ChatGPT, Gemini) and Research tool (Claude) usage.
+Detects Deep Research (ChatGPT, Gemini) and web_search tool (Claude) usage
+using structural markers only — no semantic/keyword matching.
 """
 
-import os
 import re
 from pathlib import Path
 from datetime import datetime
@@ -12,6 +12,9 @@ from datetime import datetime
 
 # Minimum character count for a file to be considered substantial research
 MIN_RESEARCH_SIZE = 5000
+# Claude web_search results can be shorter
+MIN_CLAUDE_SIZE = 2000
+
 
 # Patterns that indicate a conversation should be EXCLUDED from research index
 EXCLUSION_PATTERNS = [
@@ -19,18 +22,18 @@ EXCLUSION_PATTERNS = [
     r'task cancelled by user',
     r'η εργασία ακυρώθηκε',
     r'research cancelled',
-    
+
     # Reminder/task management (not research)
     r'google tasks',
     r'θύμισε μου',
     r'remind me tomorrow',
     r'υπενθύμιση',
     r'θα σας υπενθυμίσω',
-    
+
     # Generic list requests (not deep research)
     r'generate a comprehensive list of subreddits',
     r'list of subreddits',
-    
+
     # Meta-questions about research tools (not actual research)
     r'how long would it take for me to manually do the research',
     r'how many sources did you check',
@@ -46,17 +49,17 @@ EXCLUDED_TITLES = [
 def is_excluded_content(filepath: Path) -> bool:
     """Check if file content matches exclusion patterns."""
     content = filepath.read_text(encoding='utf-8').lower()
-    
+
     for pattern in EXCLUSION_PATTERNS:
         if re.search(pattern, content):
             return True
-    
+
     # Check filename for excluded titles
     filename = filepath.stem.lower()
     for title in EXCLUDED_TITLES:
         if title in filename:
             return True
-    
+
     return False
 
 
@@ -91,7 +94,7 @@ def extract_metadata_from_md(filepath: Path, source_hint: str = '') -> dict:
         'activities': 0,  # For Gemini
         'chars': 0,
         'first_query': '',
-        'research_type': '',
+        'detection_method': '',
     }
 
     # Try YAML frontmatter first
@@ -154,131 +157,144 @@ def extract_metadata_from_md(filepath: Path, source_hint: str = '') -> dict:
     return metadata
 
 
-def detect_research_type(filepath: Path, source_hint: str = '') -> str:
-    """Detect what type of research tool was used."""
-    content = filepath.read_text(encoding='utf-8').lower()
+# ---------------------------------------------------------------------------
+# Per-source detection functions
+# ---------------------------------------------------------------------------
 
-    # Gemini Deep Research indicators (check first for Gemini files)
-    gemini_research_patterns = [
-        "here's a research plan",
-        "i've completed your research",
-        "start research",
-        "έναρξη έρευνας",  # Greek: "Start research"
-        "research plan for that topic",
-        "let me know if you need to update it",
-        "feel free to ask me follow-up questions",  # Gemini completion pattern
-    ]
+def detect_chatgpt_deep_research(content: str, fm: dict) -> str | None:
+    """Detect ChatGPT Deep Research using structural markers.
 
-    # ChatGPT Deep Research indicators
-    chatgpt_research_patterns = [
-        'deep research',
-        'conducted a comprehensive',
-        'sources consulted',
-        'i conducted a deep',
-        'thorough research',
-        'extensive research',
-    ]
+    Tier 1: model: research in YAML frontmatter
+    Tier 2: PUA Unicode chars + source/reference headers in assistant text
+    Tier 3: Source list pattern (em-dash + italic) in last assistant response
+    Tier 4: Very long single assistant response (>30K chars) — Browse can't produce this
+    """
+    # Tier 1: model field in frontmatter
+    if fm.get('model', '').lower() == 'research':
+        return 'model:research'
 
-    # Claude Research tool indicators
-    claude_research_patterns = [
-        'research allowance',
-        'research tool',
-        'web_search',
-        'searching the web',
-        "i'll research this",
-        'let me search',
-    ]
+    # Extract assistant blocks (used by multiple tiers)
+    parts = re.split(r'### ASSISTANT', content)
+    assistant_blocks = parts[1:] if len(parts) > 1 else []
+    longest_asst = max((len(b) for b in assistant_blocks), default=0)
 
-    # Detect source from YAML frontmatter or inline metadata
-    source_match = re.search(r'^source:\s*(\w+)', content[:500], re.MULTILINE)
-    if not source_match:
-        source_match = re.search(r'\*\*source\*\*: (\w+)', content[:500].lower())
-    detected_source = source_match.group(1).lower() if source_match else source_hint.lower()
+    # Tier 2: PUA Unicode + source headers in assistant text
+    has_pua = bool(re.search(r'[\ue200\ue202]', content))
+    if has_pua:
+        assistant_text = '\n'.join(assistant_blocks)
+        has_source_header = bool(re.search(
+            r'(?i)^##+ \**(?:References|Sources Consulted|Key sources|Appendix:?\s*Sources)',
+            assistant_text, re.MULTILINE
+        ))
+        if has_source_header:
+            return 'source_header'
 
-    # Check source-specific patterns based on detected source
-    if detected_source == 'gemini':
-        for pattern in gemini_research_patterns:
-            if pattern in content:
-                return 'Gemini Deep Research'
+    # Tier 3: Source list pattern in last assistant response
+    if assistant_blocks:
+        tail = assistant_blocks[-1][-4000:]
+        # Pattern: bullet + source name + em-dash (en-dash or em-dash) + italicized description
+        source_lines = re.findall(r'\n[-*]\s+.+?\s+[–—]\s+\*.+?\*', tail)
+        if len(source_lines) >= 3:
+            return 'source_list_pattern'
 
-    if detected_source == 'claude':
-        for pattern in claude_research_patterns:
-            if pattern in content:
-                return 'Claude Research Tool'
+    # Tier 4: Very long single assistant response — Browse maxes out around 30K
+    if longest_asst > 30000:
+        return 'long_response'
 
-    if detected_source == 'chatgpt':
-        for pattern in chatgpt_research_patterns:
-            if pattern in content:
-                return 'ChatGPT Deep Research'
-
-    # Fallback: check all patterns if source not detected
-    if not detected_source:
-        for pattern in gemini_research_patterns:
-            if pattern in content:
-                return 'Gemini Deep Research'
-        for pattern in chatgpt_research_patterns:
-            if pattern in content:
-                return 'ChatGPT Deep Research'
-        for pattern in claude_research_patterns:
-            if pattern in content:
-                return 'Claude Research Tool'
-
-    # Check for research-heavy content by topic
-    if 'research' in content and ('sources' in content or 'studies' in content or 'findings' in content):
-        return 'Research Discussion'
-
-    return 'Research Topic'
+    return None
 
 
-def find_research_conversations(output_dir: Path, source_name: str = '') -> list[dict]:
-    """Find all research-related conversations."""
-    research_convs = []
+def detect_claude_research(content: str) -> str | None:
+    """Detect Claude Research tool usage.
 
-    # Search patterns - expanded to include Gemini
-    search_patterns = [
-        r'deep research',
-        r'research allowance',
-        r'conducted.*research',
-        r'research report',
-        r'research tool',
-        r"i'll research",
-        r'comprehensive research',
-        r'research findings',
-        r'sources consulted',
-        # Gemini-specific patterns
-        r"here's a research plan",
-        r"i've completed your research",
-        r'start research',
-        r'έναρξη έρευνας',  # Greek
-        r'research plan for that topic',
-    ]
+    Tier 1: Literal 'web_search' tool name in content
+    Tier 2: 'research task' phrase — Claude describes using its research feature
+    """
+    if len(content) < MIN_CLAUDE_SIZE:
+        return None
+    if 'web_search' in content:
+        return 'web_search_tool'
+    if 'research task' in content.lower():
+        return 'research_task'
+    return None
 
-    combined_pattern = '|'.join(search_patterns)
 
-    conv_dir = output_dir / 'conversations'
+def detect_gemini_deep_research(content: str) -> str | None:
+    """Detect Gemini Deep Research using structural markers.
+
+    Tier 1: "i've completed your research" or Greek equivalent
+    Tier 2: "here's a research plan" + chars > 10000
+    Tier 3: Greek "έναρξη έρευνας" + chars > 8000
+    """
+    content_lower = content.lower()
+    chars = len(content)
+
+    # Tier 1: Completed research phrase (definitive)
+    if ("i've completed your research" in content_lower
+            or "i\u2019ve completed your research" in content_lower
+            or "ολοκλήρωσα την έρευνά" in content_lower):
+        return 'completed_your_research'
+
+    # Tier 2: Research plan phrase + substantial content
+    if (("here's a research plan" in content_lower
+            or "here\u2019s a research plan" in content_lower)
+            and chars > 10000):
+        return 'research_plan'
+
+    # Tier 3: Greek research start + substantial content
+    if "έναρξη έρευνας" in content_lower and chars > 8000:
+        return 'greek_research_start'
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Scanning
+# ---------------------------------------------------------------------------
+
+def scan_source(source_dir: Path, source_name: str, detect_fn) -> list[dict]:
+    """Scan a source directory for research conversations using the given detector."""
+    conv_dir = source_dir / 'conversations'
     if not conv_dir.exists():
         return []
 
+    min_size = MIN_CLAUDE_SIZE if source_name == 'claude' else MIN_RESEARCH_SIZE
+    results = []
+
     for md_file in conv_dir.glob('*.md'):
-        content = md_file.read_text(encoding='utf-8').lower()
+        content = md_file.read_text(encoding='utf-8')
+        fm = _parse_yaml_frontmatter(content)
 
-        if re.search(combined_pattern, content):
-            # Check exclusion patterns first
-            if is_excluded_content(md_file):
-                continue
-            
-            metadata = extract_metadata_from_md(md_file, source_name)
-            
-            # Filter out very small files (likely not real research)
-            # Exception: files with file links (ChatGPT returns {{file:...}})
+        # Call the source-specific detection function
+        if source_name == 'chatgpt':
+            detection = detect_fn(content, fm)
+        else:
+            detection = detect_fn(content)
+
+        if detection is None:
+            continue
+
+        # Check exclusion patterns (skip for large files where meta-questions
+        # are incidental, not the primary content)
+        char_count = len(content)
+        try:
+            char_count = int(fm.get('characters', char_count))
+        except (ValueError, TypeError):
+            pass
+        if char_count < 20000 and is_excluded_content(md_file):
+            continue
+
+        # Size filter (except Claude which has its own threshold in detect_fn)
+        if source_name != 'claude':
             has_file_link = '{{file:' in content or 'artifacts created' in content
-            if metadata['chars'] < MIN_RESEARCH_SIZE and not has_file_link:
+            if char_count < min_size and not has_file_link:
                 continue
-            
-            metadata['research_type'] = detect_research_type(md_file, source_name)
-            research_convs.append(metadata)
 
-    return research_convs
+        metadata = extract_metadata_from_md(md_file, source_name)
+        metadata['detection_method'] = detection
+        results.append(metadata)
+
+    return results
 
 
 def create_research_index(
@@ -292,20 +308,20 @@ def create_research_index(
     print("Scanning for research conversations...")
 
     # Find research conversations from all sources
-    claude_research = find_research_conversations(claude_dir, 'claude')
-    chatgpt_research = find_research_conversations(chatgpt_dir, 'chatgpt')
-    gemini_research = find_research_conversations(gemini_dir, 'gemini')
+    chatgpt_research = scan_source(chatgpt_dir, 'chatgpt', detect_chatgpt_deep_research)
+    claude_research = scan_source(claude_dir, 'claude', detect_claude_research)
+    gemini_research = scan_source(gemini_dir, 'gemini', detect_gemini_deep_research)
 
-    print(f"  Claude: {len(claude_research)} research conversations")
     print(f"  ChatGPT: {len(chatgpt_research)} research conversations")
+    print(f"  Claude: {len(claude_research)} research conversations")
     print(f"  Gemini: {len(gemini_research)} research conversations")
 
     # Sort by date (newest first)
-    claude_research.sort(key=lambda x: x['date'], reverse=True)
     chatgpt_research.sort(key=lambda x: x['date'], reverse=True)
+    claude_research.sort(key=lambda x: x['date'], reverse=True)
     gemini_research.sort(key=lambda x: x['date'], reverse=True)
 
-    total_count = len(claude_research) + len(chatgpt_research) + len(gemini_research)
+    total_count = len(chatgpt_research) + len(claude_research) + len(gemini_research)
 
     # Generate markdown
     lines = []
@@ -320,21 +336,6 @@ def create_research_index(
     lines.append(f"- **Claude Research**: {len(claude_research)}")
     lines.append(f"- **Gemini Deep Research**: {len(gemini_research)}")
     lines.append("")
-
-    # Categorize by research type
-    all_research = claude_research + chatgpt_research + gemini_research
-    by_type = {}
-    for conv in all_research:
-        rtype = conv['research_type']
-        if rtype not in by_type:
-            by_type[rtype] = []
-        by_type[rtype].append(conv)
-
-    lines.append("### By Research Type")
-    lines.append("")
-    for rtype, convs in sorted(by_type.items()):
-        lines.append(f"- **{rtype}**: {len(convs)} conversations")
-    lines.append("")
     lines.append("---")
     lines.append("")
 
@@ -342,12 +343,12 @@ def create_research_index(
     lines.append("## ChatGPT Deep Research")
     lines.append("")
     if chatgpt_research:
-        lines.append("| Date | Title | Type | Messages | Size |")
-        lines.append("|------|-------|------|----------|------|")
+        lines.append("| Date | Title | Detection | Messages | Size |")
+        lines.append("|------|-------|-----------|----------|------|")
         for conv in chatgpt_research:
             title = conv['title'][:50] + '...' if len(conv['title']) > 50 else conv['title']
             rel_path = f"chatgpt-full/conversations/{conv['file']}"
-            lines.append(f"| {conv['date']} | [{title}]({rel_path}) | {conv['research_type']} | {conv['messages']} | {conv['chars']:,} |")
+            lines.append(f"| {conv['date']} | [[{rel_path}\\|{title}]] | {conv['detection_method']} | {conv['messages']} | {conv['chars']:,} |")
         lines.append("")
     else:
         lines.append("*No ChatGPT Deep Research conversations found.*")
@@ -360,12 +361,12 @@ def create_research_index(
     lines.append("## Claude Research")
     lines.append("")
     if claude_research:
-        lines.append("| Date | Title | Type | Messages | Size |")
-        lines.append("|------|-------|------|----------|------|")
+        lines.append("| Date | Title | Detection | Messages | Size |")
+        lines.append("|------|-------|-----------|----------|------|")
         for conv in claude_research:
             title = conv['title'][:50] + '...' if len(conv['title']) > 50 else conv['title']
             rel_path = f"claude-full/conversations/{conv['file']}"
-            lines.append(f"| {conv['date']} | [{title}]({rel_path}) | {conv['research_type']} | {conv['messages']} | {conv['chars']:,} |")
+            lines.append(f"| {conv['date']} | [[{rel_path}\\|{title}]] | {conv['detection_method']} | {conv['messages']} | {conv['chars']:,} |")
         lines.append("")
     else:
         lines.append("*No Claude Research conversations found.*")
@@ -378,14 +379,14 @@ def create_research_index(
     lines.append("## Gemini Deep Research")
     lines.append("")
     if gemini_research:
-        lines.append("| Date | Title | Type | Activities | Size |")
-        lines.append("|------|-------|------|------------|------|")
+        lines.append("| Date | Title | Detection | Activities | Size |")
+        lines.append("|------|-------|-----------|------------|------|")
         for conv in gemini_research:
             title = conv['title'][:50] + '...' if len(conv['title']) > 50 else conv['title']
             rel_path = f"gemini/conversations/{conv['file']}"
             # Use activities count for Gemini, fallback to messages
             count = conv['activities'] if conv['activities'] > 0 else conv['messages']
-            lines.append(f"| {conv['date']} | [{title}]({rel_path}) | {conv['research_type']} | {count} | {conv['chars']:,} |")
+            lines.append(f"| {conv['date']} | [[{rel_path}\\|{title}]] | {conv['detection_method']} | {count} | {conv['chars']:,} |")
         lines.append("")
     else:
         lines.append("*No Gemini Deep Research conversations found.*")
@@ -394,36 +395,40 @@ def create_research_index(
     lines.append("---")
     lines.append("")
 
-    # Detailed list with queries
-    lines.append("## Research Topics Detail")
+    # Discovery Methods documentation
+    lines.append("## Discovery Methods")
     lines.append("")
-    lines.append("### Recent Research Queries")
+    lines.append("Structural markers used to detect research conversations per platform:")
     lines.append("")
-
-    all_research_sorted = sorted(all_research, key=lambda x: x['date'], reverse=True)
-
-    for conv in all_research_sorted[:30]:  # Top 30 most recent
-        lines.append(f"#### {conv['title']}")
-        lines.append("")
-        lines.append(f"- **Date**: {conv['date']}")
-        lines.append(f"- **Source**: {conv['source']}")
-        lines.append(f"- **Type**: {conv['research_type']}")
-        lines.append(f"- **Size**: {conv['chars']:,} characters")
-        lines.append("")
-        if conv['first_query']:
-            # Handle multi-line queries in blockquote
-            query_lines = conv['first_query'].split('\n')
-            lines.append(f"> {query_lines[0]}")
-            for qline in query_lines[1:]:
-                lines.append(f"> {qline}")
-            lines.append("")
-        lines.append("---")
-        lines.append("")
+    lines.append("### ChatGPT")
+    lines.append("")
+    lines.append("| Method | Signal | Confidence |")
+    lines.append("|--------|--------|------------|")
+    lines.append("| `model:research` | `model: research` in YAML frontmatter | Definitive |")
+    lines.append("| `source_header` | PUA Unicode chars + `## References`/`### Sources Consulted` header in assistant text | High |")
+    lines.append("| `source_list_pattern` | 3+ source citation lines with em-dash + italics in last assistant response | High |")
+    lines.append("| `long_response` | Single assistant response > 30,000 chars (exceeds Browse output limits) | High |")
+    lines.append("")
+    lines.append("### Claude")
+    lines.append("")
+    lines.append("| Method | Signal | Confidence |")
+    lines.append("|--------|--------|------------|")
+    lines.append("| `web_search_tool` | Literal string `web_search` in content (tool name) | Definitive |")
+    lines.append('| `research_task` | "research task" phrase in content (Claude Research feature marker) | High |')
+    lines.append("")
+    lines.append("### Gemini")
+    lines.append("")
+    lines.append("| Method | Signal | Confidence |")
+    lines.append("|--------|--------|------------|")
+    lines.append('| `completed_your_research` | "i\'ve completed your research" or Greek equivalent | Definitive |')
+    lines.append('| `research_plan` | "here\'s a research plan" + content > 10,000 chars | High |')
+    lines.append('| `greek_research_start` | "έναρξη έρευνας" (Greek) + content > 8,000 chars | High |')
+    lines.append("")
 
     # Write output
     output_path.write_text('\n'.join(lines), encoding='utf-8')
     print(f"\nCreated: {output_path}")
-    print(f"Total research conversations indexed: {len(all_research)}")
+    print(f"Total research conversations indexed: {total_count}")
 
 
 def main():
