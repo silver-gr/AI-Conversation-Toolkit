@@ -11,13 +11,16 @@ AI Conversation Export Toolkit - extracts, analyzes, and indexes conversations f
 # =============================================================================
 # Main entry point for all imports - orchestrates extraction, logging, and post-processing
 
-# Full import from all sources (auto-detects default paths)
+# Multi-account import (recommended — reads accounts.json)
+python3 scripts/run_import.py --config accounts.json --incremental
+
+# Full import from all sources (uses accounts.json if present, else default paths)
 python3 scripts/run_import.py --all
 
 # Incremental import (only new conversations, skip existing)
 python3 scripts/run_import.py --all --incremental
 
-# Import specific sources only
+# Import specific sources only (single-account, legacy mode)
 python3 scripts/run_import.py --chatgpt ChatGPT/conversations.json
 python3 scripts/run_import.py --claude Claude/conversations.json
 python3 scripts/run_import.py --gemini "Google/path/to/MyActivity.json"
@@ -29,7 +32,7 @@ python3 scripts/run_import.py --all --research-index --memories
 python3 scripts/run_import.py --all --dry-run
 
 # Add notes to import session
-python3 scripts/run_import.py --all --notes "Monthly backup import"
+python3 scripts/run_import.py --all --notes "Weekly import"
 
 # =============================================================================
 # POST-PROCESSING
@@ -114,10 +117,13 @@ python3 scripts/import_logger.py regenerate                      # Rebuild markd
 ## Standard Import Workflow
 ```bash
 # 1. Place fresh exports in their directories:
-#    ChatGPT/conversations.json, Claude/conversations.json,
-#    Google/Η δραστηριότητά μου/Εφαρμογές Gemini/Ηδραστηριότητάμου.json
+#    Per-account directories as defined in accounts.json
+#    (e.g., ChatGPT/conversations.json, Claude-Pro/conversations.json, etc.)
 
 # 2. Run incremental import (skips previously imported conversations)
+#    Multi-account (recommended):
+python3 scripts/run_import.py --config accounts.json --incremental
+#    Single-account (legacy):
 python3 scripts/run_import.py --all --incremental
 
 # 3. Run post-processing
@@ -165,14 +171,23 @@ python3 scripts/migrate_to_yaml.py
 
 **`run_import.py`** - Unified import orchestrator (main entry point):
 - Single CLI to process all sources with consistent workflow
-- Auto-detects default export paths (ChatGPT, Claude, Gemini)
+- Multi-account support via `accounts.json` config file (`--config`)
+- `--all` auto-detects `accounts.json` if present, else falls back to `DEFAULT_PATHS`
 - Integrates ImportLogger for session tracking and deduplication
 - Post-processing: research index, memories extraction, biography extraction
 - Dry-run mode for previewing operations
 - Rich terminal output (with fallback to plain text)
 
+**`accounts.json`** - Multi-account configuration (gitignored, see `accounts.example.json`):
+- Defines multiple accounts per platform (e.g., 3 Claude accounts, 2 ChatGPT accounts)
+- Each entry: `{"name": "personal", "source": "chatgpt", "export_path": "ChatGPT/conversations.json"}`
+- Paths can be relative (to project root) or absolute
+- Used by `run_import.py --config accounts.json`
+
 **`import_logger.py`** - Import tracking system:
 - `ImportLogger` class tracks import sessions across sources (ChatGPT, Claude, Gemini)
+- Supports account-qualified source keys (e.g., `chatgpt:personal`, `claude:pro`)
+- `get_imported_ids()` pools IDs across all accounts of the same platform for deduplication
 - JSON log (`imports/import_log.json`) stores per-import stats and conversation IDs
 - Auto-generates timestamped markdown reports (`imports/IMPORT_LOG_*.md`)
 - `get_imported_ids(source)` returns all previously imported IDs for deduplication
@@ -238,6 +253,7 @@ type: conversation
 title: "Conversation Title"
 date: 2025-07-02T14:30:00
 source: chatgpt    # chatgpt | claude | gemini
+account: personal  # optional, from accounts.json (omitted if unnamed)
 model: null
 messages: 28
 characters: 38198
@@ -304,7 +320,8 @@ imports/
 
 ## File Locations
 
-- Raw exports: `ChatGPT/`, `Claude/`, `Google/` (gitignored)
+- Raw exports: `ChatGPT/`, `Claude/`, `Google/` (gitignored, per-account dirs like `Claude-Pro/` also gitignored)
+- Account config: `accounts.json` (gitignored, see `accounts.example.json` for template)
 - Generated output: `output/` (gitignored)
 - Import logs: `imports/` (tracked in git)
 - Cache DBs: `*_cache.db` files (gitignored)
@@ -333,12 +350,19 @@ imports/
       "completed_at": "2025-12-16T17:00:00+00:00",
       "status": "completed",
       "sources": {
-        "chatgpt": {
+        "chatgpt:personal": {
           "file": "conversations.json",
           "total_in_export": 1605,
           "new_imported": 16,
           "skipped_existing": 0,
           "conversation_ids": ["uuid1", "uuid2", "..."]
+        },
+        "claude:main": {
+          "file": "conversations.json",
+          "total_in_export": 512,
+          "new_imported": 51,
+          "skipped_existing": 0,
+          "conversation_ids": ["uuid3", "uuid4", "..."]
         }
       },
       "post_processing": ["research_index"],
@@ -348,7 +372,7 @@ imports/
   "metadata": {
     "last_updated": "2026-02-09T...",
     "total_imports": 5,
-    "schema_version": "1.0.0"
+    "schema_version": "1.1.0"
   }
 }
 ```
@@ -358,7 +382,8 @@ imports/
 - **Gemini session grouping**: Activities within 30 minutes are grouped into one conversation. Use `--no-grouping` to disable.
 - **YAML frontmatter required**: `research_index.py` and `migrate_to_yaml.py` both expect YAML frontmatter. Run migration if working with old-format files.
 - **Gemini non-descriptive titles**: Many Gemini Deep Research sessions default to "start-research". Run `gemini_meta_indexer.py --rename` after imports.
-- **Import ID tracking**: The import logger tracks conversation UUIDs (ChatGPT/Claude) and session timestamps (Gemini) for deduplication. All current exports have 100% ID coverage.
+- **Import ID tracking**: The import logger tracks conversation UUIDs (ChatGPT/Claude) and session timestamps (Gemini) for deduplication. All current exports have 100% ID coverage. Multi-account imports use composite source keys (`chatgpt:personal`) in the import log; `get_imported_ids()` pools across all accounts of the same platform.
+- **Multi-account setup**: Copy `accounts.example.json` to `accounts.json` and edit paths. Conversations from all accounts merge into the same output directories (`chatgpt-full/`, `claude-full/`, `gemini/`). The `account:` YAML frontmatter field tracks provenance.
 - **ChatGPT split exports**: As of March 2026, ChatGPT exports conversations as multiple `conversations-000.json` ... `conversations-NNN.json` files (100 per file) instead of a single `conversations.json`. Merge before importing: `python3 -c "import json,glob; data=[c for f in sorted(glob.glob('ChatGPT/conversations-*.json')) for c in json.load(open(f))]; json.dump(data, open('ChatGPT/conversations.json','w'))"`. Internal format (`mapping` dict) is unchanged.
 - **Quality filter is reversible**: Excluded files are moved to `output/_excluded/`, not deleted. Move them back to restore.
 - **Biography extractors require `uv run`**: Both `biography_extractor.py` and `biography_extractor_v2.py` use inline script dependencies (`rich`) and must be run with `uv run`, not `python3`.

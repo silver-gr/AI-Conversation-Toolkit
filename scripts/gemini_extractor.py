@@ -247,7 +247,7 @@ def _extract_topics_gemini(activities: list[dict]) -> list[str]:
     return [word for word, count in sorted_words[:10] if count >= 1]
 
 
-def activity_to_markdown(conv: dict) -> str:
+def activity_to_markdown(conv: dict, account: str | None = None) -> str:
     """Convert a conversation/activity group to markdown."""
     lines = []
 
@@ -272,6 +272,8 @@ def activity_to_markdown(conv: dict) -> str:
     else:
         lines.append("date: null")
     lines.append("source: gemini")
+    if account:
+        lines.append(f"account: {account}")
     lines.append("model: null")
     lines.append(f"messages: {len(activities)}")
     lines.append(f"characters: {total_chars}")
@@ -364,10 +366,11 @@ def process_gemini_export(
     max_conversations: int = None,
     no_grouping: bool = False,
     incremental: bool = False,
-    imported_ids: set[str] = None
+    imported_ids: set[str] = None,
+    account: str | None = None,
 ) -> dict:
     """Process Gemini export and create markdown files.
-    
+
     Args:
         input_path: Path to the Gemini activity JSON file
         output_dir: Directory to write markdown files
@@ -375,7 +378,8 @@ def process_gemini_export(
         no_grouping: Keep each activity separate (no session grouping)
         incremental: Skip already imported conversations
         imported_ids: Set of conversation IDs to skip (from previous imports)
-    
+        account: Optional account name for multi-account setups
+
     Returns:
         dict with stats including:
         - processed: number of conversations written
@@ -469,7 +473,7 @@ def process_gemini_export(
             counter += 1
 
         # Generate markdown
-        md_content = activity_to_markdown(conv)
+        md_content = activity_to_markdown(conv, account=account)
         filepath.write_text(md_content, encoding='utf-8')
 
         # Calculate stats

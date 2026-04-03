@@ -200,7 +200,8 @@ def _extract_model(conv: dict) -> str | None:
     return None
 
 
-def conversation_to_markdown(conv: dict, include_full_content: bool = True) -> str:
+def conversation_to_markdown(conv: dict, include_full_content: bool = True,
+                             account: str | None = None) -> str:
     """Convert a conversation to markdown with FULL content."""
     lines = []
 
@@ -224,6 +225,8 @@ def conversation_to_markdown(conv: dict, include_full_content: bool = True) -> s
     else:
         lines.append("date: null")
     lines.append(f"source: {source}")
+    if account:
+        lines.append(f"account: {account}")
     if model:
         lines.append(f"model: {model}")
     else:
@@ -322,10 +325,11 @@ def process_export(
     max_conversations: int = None,
     full_content: bool = True,
     incremental: bool = False,
-    imported_ids: set[str] = None
+    imported_ids: set[str] = None,
+    account: str | None = None,
 ) -> dict:
     """Process an export file and create markdown files.
-    
+
     Args:
         input_path: Path to the conversations.json file
         output_dir: Directory to write markdown files
@@ -333,7 +337,8 @@ def process_export(
         full_content: Include full content or truncate
         incremental: Skip already imported conversations
         imported_ids: Set of conversation IDs to skip (from previous imports)
-    
+        account: Optional account name for multi-account setups
+
     Returns:
         dict with stats including:
         - processed: number of conversations written
@@ -406,7 +411,8 @@ def process_export(
             counter += 1
 
         # Generate markdown
-        md_content = conversation_to_markdown(conv, include_full_content=full_content)
+        md_content = conversation_to_markdown(conv, include_full_content=full_content,
+                                              account=account)
         filepath.write_text(md_content, encoding='utf-8')
 
         # Update stats

@@ -1,0 +1,29 @@
+{
+  "accounts": [
+    {
+      "name": "personal",
+      "source": "chatgpt",
+      "export_path": "ChatGPT/conversations.json"
+    },
+    {
+      "name": "work",
+      "source": "chatgpt",
+      "export_path": "ChatGPT-Work/conversations.json"
+    },
+    {
+      "name": "main",
+      "source": "claude",
+      "export_path": "Claude/conversations.json"
+    },
+    {
+      "name": "pro",
+      "source": "claude",
+      "export_path": "Claude-Pro/conversations.json"
+    },
+    {
+      "name": "primary",
+      "source": "gemini",
+      "export_path": "Google/My Activity/Gemini Apps/MyActivity.json"
+    }
+  ]
+}

@@ -33,8 +33,13 @@ output/
 
 # Raw exports and activity data
 ChatGPT/
+ChatGPT-*/
 Claude/
+Claude-*/
 Google/
+
+# Account config (contains local paths)
+accounts.json
 
 # Local archives / exports
 *.zip

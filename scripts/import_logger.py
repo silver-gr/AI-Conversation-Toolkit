@@ -53,7 +53,7 @@ class ImportLogger:
             "metadata": {
                 "last_updated": datetime.now(timezone.utc).isoformat(),
                 "total_imports": 0,
-                "schema_version": "1.0.0"
+                "schema_version": "1.1.0"
             }
         }
 
@@ -150,6 +150,14 @@ class ImportLogger:
 
         return import_record.copy()
 
+    @staticmethod
+    def _base_source(source_key: str) -> str:
+        """Extract base source from a possibly account-qualified key.
+
+        'chatgpt:personal' -> 'chatgpt', 'claude' -> 'claude'
+        """
+        return source_key.split(':')[0]
+
     def record_source(
         self,
         import_id: str,
@@ -161,7 +169,9 @@ class ImportLogger:
 
         Args:
             import_id: The import session ID.
-            source: Source name ('chatgpt', 'claude', or 'gemini').
+            source: Source name, optionally account-qualified.
+                Plain: 'chatgpt', 'claude', 'gemini'
+                With account: 'chatgpt:personal', 'claude:pro'
             stats: Dictionary containing source statistics. Expected keys:
                 - file: Source file name
                 - total_in_export: Total conversations in the export file
@@ -173,12 +183,13 @@ class ImportLogger:
             ValueError: If the import_id doesn't exist or source is invalid.
             KeyError: If required stats keys are missing.
         """
-        # Validate source
+        # Validate base source (before the colon)
         source = source.lower()
-        if source not in self.SUPPORTED_SOURCES:
+        base = self._base_source(source)
+        if base not in self.SUPPORTED_SOURCES:
             raise ValueError(
-                f"Invalid source '{source}'. "
-                f"Must be one of: {', '.join(sorted(self.SUPPORTED_SOURCES))}"
+                f"Invalid source '{source}'. Base must be one of: "
+                f"{', '.join(sorted(self.SUPPORTED_SOURCES))}"
             )
 
         # Validate required stats keys
@@ -341,22 +352,26 @@ class ImportLogger:
         Get all conversation IDs that have been imported for a source.
 
         Scans all completed imports and aggregates conversation IDs.
-        Useful for deduplication during subsequent imports.
+        Matches by base source prefix so 'chatgpt' collects IDs from
+        'chatgpt', 'chatgpt:personal', 'chatgpt:work', etc.
 
         Args:
-            source: Source name ('chatgpt', 'claude', or 'gemini').
+            source: Source name or account-qualified key.
+                'chatgpt' matches all ChatGPT accounts.
+                'chatgpt:personal' also works (matches by base source).
 
         Returns:
             Set of all imported conversation IDs for the source.
 
         Raises:
-            ValueError: If source is invalid.
+            ValueError: If base source is invalid.
         """
         source = source.lower()
-        if source not in self.SUPPORTED_SOURCES:
+        base = self._base_source(source)
+        if base not in self.SUPPORTED_SOURCES:
             raise ValueError(
-                f"Invalid source '{source}'. "
-                f"Must be one of: {', '.join(sorted(self.SUPPORTED_SOURCES))}"
+                f"Invalid source '{source}'. Base must be one of: "
+                f"{', '.join(sorted(self.SUPPORTED_SOURCES))}"
             )
 
         log_data = self._read_log()
@@ -367,9 +382,9 @@ class ImportLogger:
             if imp["status"] != "completed":
                 continue
 
-            source_data = imp.get("sources", {}).get(source)
-            if source_data:
-                imported_ids.update(source_data.get("conversation_ids", []))
+            for src_key, src_data in imp.get("sources", {}).items():
+                if self._base_source(src_key) == base:
+                    imported_ids.update(src_data.get("conversation_ids", []))
 
         return imported_ids
 
@@ -420,12 +435,13 @@ class ImportLogger:
         stats["last_import"] = completed_imports[-1].get("completed_at")
 
         for imp in completed_imports:
-            for source, source_data in imp.get("sources", {}).items():
-                if source in stats["by_source"]:
-                    stats["by_source"][source]["conversations"] += (
+            for source_key, source_data in imp.get("sources", {}).items():
+                base = self._base_source(source_key)
+                if base in stats["by_source"]:
+                    stats["by_source"][base]["conversations"] += (
                         source_data.get("new_imported", 0)
                     )
-                    stats["by_source"][source]["imports"] += 1
+                    stats["by_source"][base]["imports"] += 1
 
         return stats
 
@@ -505,19 +521,31 @@ class ImportLogger:
                 date = imp.get("completed_at", imp.get("started_at", ""))[:10]
                 import_id = imp["id"]
 
-                # Get per-source counts
-                chatgpt = imp.get("sources", {}).get("chatgpt", {})
-                claude = imp.get("sources", {}).get("claude", {})
-                gemini = imp.get("sources", {}).get("gemini", {})
-
-                chatgpt_count = chatgpt.get("new_imported", 0)
-                claude_count = claude.get("new_imported", 0)
-                gemini_count = gemini.get("new_imported", 0)
+                # Aggregate counts by base source (handles account-qualified keys)
+                source_counts: dict[str, dict] = {}
+                for src_key, src_data in imp.get("sources", {}).items():
+                    base = self._base_source(src_key)
+                    if base not in source_counts:
+                        source_counts[base] = {
+                            "new_imported": 0, "skipped_existing": 0
+                        }
+                    source_counts[base]["new_imported"] += (
+                        src_data.get("new_imported", 0)
+                    )
+                    source_counts[base]["skipped_existing"] += (
+                        src_data.get("skipped_existing", 0)
+                    )
 
                 # Format counts with skipped info
-                chatgpt_str = self._format_count(chatgpt)
-                claude_str = self._format_count(claude)
-                gemini_str = self._format_count(gemini)
+                chatgpt_str = self._format_count(
+                    source_counts.get("chatgpt", {})
+                )
+                claude_str = self._format_count(
+                    source_counts.get("claude", {})
+                )
+                gemini_str = self._format_count(
+                    source_counts.get("gemini", {})
+                )
 
                 post = ", ".join(imp.get("post_processing", [])) or "-"
 
@@ -583,8 +611,12 @@ class ImportLogger:
             lines.append("**Sources:**")
             lines.append("")
 
-            for source_name, source_data in sources.items():
-                lines.append(f"*{source_name.upper()}*:")
+            for source_key, source_data in sources.items():
+                # Display account-qualified keys nicely
+                base = self._base_source(source_key)
+                account = source_key.split(':', 1)[1] if ':' in source_key else None
+                label = f"{base.upper()} ({account})" if account else base.upper()
+                lines.append(f"*{label}*:")
                 lines.append(f"- File: `{source_data.get('file', 'N/A')}`")
                 lines.append(
                     f"- Total in export: {source_data.get('total_in_export', 0):,}"

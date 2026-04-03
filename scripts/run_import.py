@@ -4,9 +4,13 @@ Unified Import CLI - Run complete AI conversation import workflow.
 
 This is the main entry point for running imports from ChatGPT, Claude, and Gemini.
 It orchestrates the entire workflow including extraction, logging, and post-processing.
+Supports multiple accounts per platform via accounts.json config file.
 
 Usage:
-    # Full import (all sources)
+    # Full import from accounts config (recommended for multi-account)
+    python3 scripts/run_import.py --config accounts.json --incremental
+
+    # Full import (all sources, single-account fallback)
     python3 scripts/run_import.py --all
 
     # Incremental import (only new conversations)
@@ -82,6 +86,63 @@ DEFAULT_OUTPUT_DIR = Path('output')
 
 # Import log directory
 DEFAULT_IMPORTS_DIR = Path('imports')
+
+# Default accounts config file
+DEFAULT_CONFIG = Path('accounts.json')
+
+
+def load_accounts_config(config_path: Path, base_dir: Path) -> list[dict] | None:
+    """Load multi-account configuration from JSON file.
+
+    Args:
+        config_path: Path to accounts.json
+        base_dir: Project root for resolving relative paths
+
+    Returns:
+        List of account dicts with keys: name, source, path.
+        None if config file doesn't exist.
+
+    Raises:
+        ValueError: If config is malformed.
+    """
+    if not config_path.exists():
+        return None
+
+    with open(config_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    accounts = data.get('accounts', [])
+    if not accounts:
+        raise ValueError(f"No accounts defined in {config_path}")
+
+    valid_sources = {'chatgpt', 'claude', 'gemini'}
+    resolved = []
+    for entry in accounts:
+        name = entry.get('name', '').strip()
+        source = entry.get('source', '').strip().lower()
+        export_path = entry.get('export_path', '').strip()
+
+        if not all([name, source, export_path]):
+            raise ValueError(
+                f"Account entry missing required fields (name, source, export_path): {entry}"
+            )
+        if source not in valid_sources:
+            raise ValueError(
+                f"Invalid source '{source}' for account '{name}'. "
+                f"Must be one of: {', '.join(sorted(valid_sources))}"
+            )
+
+        path = Path(export_path)
+        if not path.is_absolute():
+            path = base_dir / path
+
+        resolved.append({
+            'name': name,
+            'source': source,
+            'path': path,
+        })
+
+    return resolved
 
 
 # ==============================================================================
@@ -222,10 +283,19 @@ def extract_source(
     input_path: Path,
     output_dir: Path,
     incremental: bool = False,
-    imported_ids: set = None
+    imported_ids: set = None,
+    account: str | None = None,
 ) -> dict:
     """
     Extract conversations from a source.
+
+    Args:
+        source: Base source type ('chatgpt', 'claude', 'gemini')
+        input_path: Path to the export file
+        output_dir: Base output directory
+        incremental: Skip already imported conversations
+        imported_ids: Set of previously imported conversation IDs
+        account: Optional account name for multi-account setups
 
     Returns dict with:
         - file: source filename
@@ -246,7 +316,8 @@ def extract_source(
         print_error(f"File not found: {input_path}")
         return stats
 
-    print_info(f"Processing {source.upper()}: {input_path}")
+    label = f"{source.upper()} ({account})" if account else source.upper()
+    print_info(f"Processing {label}: {input_path}")
 
     try:
         if source == 'gemini':
@@ -255,6 +326,7 @@ def extract_source(
                 output_dir / 'gemini',
                 incremental=incremental,
                 imported_ids=imported_ids if imported_ids else set(),
+                account=account,
             )
             stats['total_in_export'] = result.get('total_activities', result.get('total', 0))
             stats['new_imported'] = result.get('processed', 0)
@@ -267,6 +339,7 @@ def extract_source(
                 output_dir / f'{source}-full',
                 incremental=incremental,
                 imported_ids=imported_ids,
+                account=account,
             )
             stats['total_in_export'] = result.get('total', 0)
             stats['new_imported'] = result.get('processed', 0)
@@ -274,11 +347,11 @@ def extract_source(
             stats['conversation_ids'] = result.get('new_ids', [])
 
         print_success(
-            f"  Imported {stats['new_imported']} conversations from {source.upper()}"
+            f"  Imported {stats['new_imported']} conversations from {label}"
         )
 
     except Exception as e:
-        print_error(f"Failed to extract {source}: {e}")
+        print_error(f"Failed to extract {label}: {e}")
         raise
 
     return stats
@@ -378,6 +451,7 @@ def run_import(
     run_memories: bool = False,
     notes: str = "",
     dry_run: bool = False,
+    config_path: Optional[str] = None,
 ) -> int:
     """
     Run the complete import workflow.
@@ -392,19 +466,42 @@ def run_import(
     output_path = Path(output_dir) if output_dir else base_dir / DEFAULT_OUTPUT_DIR
     imports_path = Path(imports_dir) if imports_dir else base_dir / DEFAULT_IMPORTS_DIR
 
-    # Resolve source paths
-    source_paths = resolve_paths(
-        base_dir,
-        chatgpt_path,
-        claude_path,
-        gemini_path,
-        use_all
-    )
+    # Build list of accounts to process: [{name, source, path}, ...]
+    accounts = None
 
-    if not source_paths:
-        print_error("No source files found or specified")
-        print_info("Use --all to process default paths, or specify paths explicitly")
-        return 1
+    # Try config file first
+    cfg_file = Path(config_path) if config_path else base_dir / DEFAULT_CONFIG
+    if config_path or (use_all and cfg_file.exists()):
+        try:
+            accounts = load_accounts_config(cfg_file, base_dir)
+            if accounts:
+                print_info(f"Loaded {len(accounts)} accounts from {cfg_file}")
+        except (ValueError, json.JSONDecodeError) as e:
+            if config_path:
+                # Explicit --config: fail hard
+                print_error(f"Config error: {e}")
+                return 1
+            else:
+                # Implicit auto-detect: warn and fall back
+                print_warning(f"Config error in {cfg_file}: {e}")
+                print_info("Falling back to default paths")
+
+    # Fall back to legacy path resolution
+    if not accounts:
+        source_paths = resolve_paths(
+            base_dir, chatgpt_path, claude_path, gemini_path, use_all
+        )
+        if not source_paths:
+            print_error("No source files found or specified")
+            print_info(
+                "Use --config accounts.json, --all, or specify paths explicitly"
+            )
+            return 1
+        # Convert to account format (unnamed accounts)
+        accounts = [
+            {'name': None, 'source': source, 'path': path}
+            for source, path in source_paths.items()
+        ]
 
     # Print configuration
     print_header("AI Conversation Import")
@@ -416,15 +513,19 @@ def run_import(
         print_warning("DRY RUN - No changes will be made")
 
     print()
-    print_info("Sources to process:")
-    for source, path in source_paths.items():
-        exists = path.exists() if path else False
+    print_info("Accounts to process:")
+    for acct in accounts:
+        label = (
+            f"{acct['source'].upper()} ({acct['name']})"
+            if acct['name'] else acct['source'].upper()
+        )
+        exists = acct['path'].exists()
         status = "[exists]" if exists else "[not found]"
         if RICH_AVAILABLE:
             color = "green" if exists else "red"
-            console.print(f"  {source.upper()}: {path} [{color}]{status}[/{color}]")
+            console.print(f"  {label}: {acct['path']} [{color}]{status}[/{color}]")
         else:
-            print(f"  {source.upper()}: {path} {status}")
+            print(f"  {label}: {acct['path']} {status}")
 
     print()
 
@@ -450,19 +551,36 @@ def run_import(
     success = True
 
     try:
-        # Process each source
-        for source, path in source_paths.items():
+        # Process each account
+        for acct in accounts:
+            source = acct['source']
+            path = acct['path']
+            account_name = acct['name']
+
             if not path.exists():
-                print_warning(f"Skipping {source}: file not found")
+                label = (
+                    f"{source} ({account_name})"
+                    if account_name else source
+                )
+                print_warning(f"Skipping {label}: file not found")
                 continue
+
+            # Composite key for import log: "chatgpt:personal" or "chatgpt"
+            log_key = (
+                f"{source}:{account_name}" if account_name else source
+            )
 
             try:
                 # Load previously imported IDs for incremental mode
+                # (pools across all accounts of the same source type)
                 imported_ids = None
                 if incremental:
                     imported_ids = logger.get_imported_ids(source)
                     if imported_ids:
-                        print_info(f"  Found {len(imported_ids)} previously imported conversations")
+                        print_info(
+                            f"  Found {len(imported_ids)} previously "
+                            f"imported {source} conversations"
+                        )
 
                 stats = extract_source(
                     source=source,
@@ -470,16 +588,17 @@ def run_import(
                     output_dir=output_path,
                     incremental=incremental,
                     imported_ids=imported_ids,
+                    account=account_name,
                 )
 
-                results[source] = stats
+                results[log_key] = stats
 
-                # Record in import log
-                logger.record_source(import_id, source, stats)
+                # Record in import log with composite key
+                logger.record_source(import_id, log_key, stats)
 
             except Exception as e:
-                print_error(f"Failed to process {source}: {e}")
-                results[source] = {
+                print_error(f"Failed to process {log_key}: {e}")
+                results[log_key] = {
                     'file': path.name,
                     'total_in_export': 0,
                     'new_imported': 0,
@@ -517,23 +636,24 @@ def run_import(
     print_header("Import Summary")
 
     # Results table
-    headers = ["Source", "Total", "Imported", "Skipped"]
+    headers = ["Source", "Account", "Total", "Imported", "Skipped"]
     rows = []
 
     total_imported = 0
     total_in_export = 0
 
-    for source in ['chatgpt', 'claude', 'gemini']:
-        if source in results:
-            stats = results[source]
-            rows.append([
-                source.upper(),
-                stats['total_in_export'],
-                stats['new_imported'],
-                stats['skipped_existing'],
-            ])
-            total_imported += stats['new_imported']
-            total_in_export += stats['total_in_export']
+    for log_key, stats in results.items():
+        base = log_key.split(':')[0]
+        account = log_key.split(':')[1] if ':' in log_key else '-'
+        rows.append([
+            base.upper(),
+            account,
+            stats['total_in_export'],
+            stats['new_imported'],
+            stats['skipped_existing'],
+        ])
+        total_imported += stats['new_imported']
+        total_in_export += stats['total_in_export']
 
     if rows:
         print_table("Extraction Results", headers, rows)
@@ -559,7 +679,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process all available sources
+  # Multi-account import (recommended)
+  python3 scripts/run_import.py --config accounts.json --incremental
+
+  # Process all sources (uses accounts.json if present)
   python3 scripts/run_import.py --all
 
   # Process only ChatGPT with custom path
@@ -582,7 +705,12 @@ Examples:
         '--all', '-a',
         action='store_true',
         dest='use_all',
-        help='Process all available sources using default paths'
+        help='Process all sources (uses accounts.json if present, else default paths)'
+    )
+    source_group.add_argument(
+        '--config', '-c',
+        metavar='FILE',
+        help='Path to accounts.json config file for multi-account imports'
     )
     source_group.add_argument(
         '--chatgpt',
@@ -662,10 +790,13 @@ Examples:
     args = parser.parse_args()
 
     # Validate arguments
-    if not args.use_all and not any([args.chatgpt, args.claude, args.gemini]):
+    has_source = any([args.chatgpt, args.claude, args.gemini])
+    if not args.use_all and not args.config and not has_source:
         parser.print_help()
         print()
-        print_error("No sources specified. Use --all or specify paths explicitly.")
+        print_error(
+            "No sources specified. Use --config, --all, or specify paths."
+        )
         return 1
 
     # Run import
@@ -673,7 +804,7 @@ Examples:
         chatgpt_path=args.chatgpt,
         claude_path=args.claude,
         gemini_path=args.gemini,
-        use_all=args.use_all,
+        use_all=args.use_all or bool(args.config),
         incremental=args.incremental,
         output_dir=args.output_dir,
         imports_dir=args.imports_dir,
@@ -682,6 +813,7 @@ Examples:
         run_memories=args.memories,
         notes=args.notes,
         dry_run=args.dry_run,
+        config_path=args.config,
     )
 
 
