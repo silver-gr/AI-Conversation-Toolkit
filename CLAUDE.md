@@ -336,8 +336,9 @@ imports/
 | 2026-01-25 | — | — | 343 | First Gemini import |
 | 2026-02-09 | 48 | 319 | 8 | Latest import |
 | 2026-03-02 | 28 | 30 | — | Split-file export format (merged before import) |
+| 2026-07-07 | 138 | 150 | 95 | Auto-merge built in; fixed `children`-less mapping (silent 0-import); Gemini activity-level dedup |
 
-**Totals**: 1,633 ChatGPT + 542 Claude + 740 Gemini sessions = **100% ID coverage**
+**Totals**: 1,771 ChatGPT + 692 Claude + 835 Gemini sessions
 
 ## Import Log Schema
 
@@ -384,7 +385,9 @@ imports/
 - **Gemini non-descriptive titles**: Many Gemini Deep Research sessions default to "start-research". Run `gemini_meta_indexer.py --rename` after imports.
 - **Import ID tracking**: The import logger tracks conversation UUIDs (ChatGPT/Claude) and session timestamps (Gemini) for deduplication. All current exports have 100% ID coverage. Multi-account imports use composite source keys (`chatgpt:personal`) in the import log; `get_imported_ids()` pools across all accounts of the same platform.
 - **Multi-account setup**: Copy `accounts.example.json` to `accounts.json` and edit paths. Conversations from all accounts merge into the same output directories (`chatgpt-full/`, `claude-full/`, `gemini/`). The `account:` YAML frontmatter field tracks provenance.
-- **ChatGPT split exports**: As of March 2026, ChatGPT exports conversations as multiple `conversations-000.json` ... `conversations-NNN.json` files (100 per file) instead of a single `conversations.json`. Merge before importing: `python3 -c "import json,glob; data=[c for f in sorted(glob.glob('ChatGPT/conversations-*.json')) for c in json.load(open(f))]; json.dump(data, open('ChatGPT/conversations.json','w'))"`. Internal format (`mapping` dict) is unchanged.
+- **ChatGPT split exports (auto-merged)**: As of March 2026, ChatGPT exports conversations as multiple `conversations-000.json` ... `conversations-NNN.json` files (100 per file) instead of a single `conversations.json`. **`run_import.py` now merges these automatically** (`merge_chatgpt_splits()`): when split files are present it (re)builds `ChatGPT/conversations.json` before extraction, rewriting only when a split is newer than the merged file. Manual merge (if needed): `python3 -c "import json,glob; data=[c for f in sorted(glob.glob('ChatGPT/conversations-*.json')) for c in json.load(open(f))]; json.dump(data, open('ChatGPT/conversations.json','w'))"`.
+- **ChatGPT `children`-less mapping (2026+)**: Newer ChatGPT exports drop the per-node `children` array in the `mapping` tree and keep only `parent`. `traverse_chatgpt_tree()` reconstructs child adjacency from `parent` pointers (works for older exports too). Symptom if this regresses: extraction reports "Found N conversations" but "Processed: 0" — a **silent zero-import**, no error.
+- **Gemini dedup is activity-level**: Gemini has no per-conversation ID, so the extractor synthesizes one from a session-boundary timestamp. Session grouping (30-min gaps) can shift between exports, so `process_gemini_export()` now also records every activity's stable timestamp id and skips a session if its boundary id was seen **or all its activities were already imported**. Expect occasional single `_N` duplicate files on a boundary shift; the activity-level guard suppresses them on subsequent runs.
 - **Quality filter is reversible**: Excluded files are moved to `output/_excluded/`, not deleted. Move them back to restore.
 - **Biography extractors require `uv run`**: Both `biography_extractor.py` and `biography_extractor_v2.py` use inline script dependencies (`rich`) and must be run with `uv run`, not `python3`.
 - **Profile generation is two-step**: Run `biography_extractor*.py` first to produce `extractions.json`, then `profile_generator.py` to build the markdown profile.

@@ -86,8 +86,14 @@ def parse_claude_export(filepath: Path) -> Generator[dict, None, None]:
 # CHATGPT PARSER
 # =============================================================================
 
-def traverse_chatgpt_tree(mapping: dict, node_id: str, visited: set = None) -> list[dict]:
-    """Traverse ChatGPT's tree structure."""
+def traverse_chatgpt_tree(mapping: dict, node_id: str, children_map: dict,
+                          visited: set = None) -> list[dict]:
+    """Traverse ChatGPT's tree structure.
+
+    `children_map` maps node_id -> list of child node_ids. It is reconstructed
+    from `parent` pointers by the caller because newer ChatGPT exports (2026+)
+    omit the per-node `children` array and keep only `parent`.
+    """
     if visited is None:
         visited = set()
 
@@ -125,10 +131,9 @@ def traverse_chatgpt_tree(mapping: dict, node_id: str, visited: set = None) -> l
                 'model': metadata.get('model_slug', '')
             })
 
-    # Build children map and traverse
-    children = node.get('children', [])
-    for child_id in children:
-        messages.extend(traverse_chatgpt_tree(mapping, child_id, visited))
+    # Descend into children (adjacency reconstructed from parent pointers)
+    for child_id in children_map.get(node_id, []):
+        messages.extend(traverse_chatgpt_tree(mapping, child_id, children_map, visited))
 
     return messages
 
@@ -144,16 +149,21 @@ def parse_chatgpt_export(filepath: Path) -> Generator[dict, None, None]:
     for conv in data:
         mapping = conv.get('mapping', {})
 
-        # Find root node
+        # Reconstruct child adjacency from parent pointers and find the root.
+        # Newer ChatGPT exports (2026+) drop the 'children' array and keep only
+        # 'parent'; deriving children from 'parent' works for older exports too.
+        children_map: dict[str, list[str]] = {}
         root_id = None
         for node_id, node in mapping.items():
-            if node.get('parent') is None:
+            parent = node.get('parent')
+            if parent is None:
                 root_id = node_id
-                break
+            else:
+                children_map.setdefault(parent, []).append(node_id)
 
         messages = []
         if root_id:
-            messages = traverse_chatgpt_tree(mapping, root_id)
+            messages = traverse_chatgpt_tree(mapping, root_id, children_map)
 
         if not messages:
             continue

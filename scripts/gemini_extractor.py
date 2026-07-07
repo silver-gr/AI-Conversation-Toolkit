@@ -448,11 +448,23 @@ def process_gemini_export(
     summaries = []
 
     for conv in conversations:
-        # Get conversation ID (timestamp-based)
+        # Dedup keys: the session-boundary id (back-compat) PLUS every
+        # activity's stable timestamp id. Session grouping can shift between
+        # exports, so treat a session as already imported if its boundary id
+        # was seen OR every one of its activities was already imported. The
+        # activity-level test is grouping-independent (activity times never
+        # move), so it survives boundary drift that the boundary id cannot.
         conv_id = conv.get('id', '')
-        
+        activity_ids = [
+            a['timestamp'].isoformat()
+            for a in conv['activities'] if a.get('timestamp')
+        ]
+
         # Skip if already imported (incremental mode)
-        if incremental and conv_id in imported_ids:
+        already_imported = conv_id in imported_ids or (
+            bool(activity_ids) and all(a in imported_ids for a in activity_ids)
+        )
+        if incremental and already_imported:
             stats['skipped'] += 1
             continue
 
@@ -483,7 +495,13 @@ def process_gemini_export(
         )
         stats['processed'] += 1
         stats['total_chars'] += char_count
-        stats['new_ids'].append(conv_id)
+        # Record activity-level ids (grouping-independent) so future imports
+        # can dedup even if session boundaries shift. The boundary id is one
+        # of these, so session-level matching keeps working too.
+        if activity_ids:
+            stats['new_ids'].extend(activity_ids)
+        else:
+            stats['new_ids'].append(conv_id)
 
         summaries.append({
             'title': conv['title'],

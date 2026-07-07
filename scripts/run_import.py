@@ -246,7 +246,9 @@ def resolve_paths(
             paths['chatgpt'] = Path(chatgpt_path)
         else:
             default = base_dir / DEFAULT_PATHS['chatgpt']
-            if default.exists():
+            # Include ChatGPT if the merged file exists OR split exports are
+            # present (they get merged into `default` before extraction).
+            if default.exists() or list(default.parent.glob('conversations-*.json')):
                 paths['chatgpt'] = default
 
         if claude_path:
@@ -272,6 +274,46 @@ def resolve_paths(
             paths['gemini'] = Path(gemini_path)
 
     return paths
+
+
+def merge_chatgpt_splits(target: Path) -> Path:
+    """Merge split ChatGPT exports (conversations-NNN.json) into a single file.
+
+    Since ~March 2026, ChatGPT Takeout ships conversations as
+    conversations-000.json ... conversations-NNN.json (100 convs each) with no
+    combined conversations.json. This merges them, in filename order, into
+    `target`. The split files are the source of truth, so the merged file is
+    rewritten whenever any split is newer than the existing merged file.
+
+    Returns the path the extractor should read (always `target`).
+    """
+    split_files = sorted(target.parent.glob('conversations-*.json'))
+    if not split_files:
+        return target  # single-file export (or nothing) - use target as-is
+
+    # Skip re-merging if the combined file is already up to date.
+    if target.exists():
+        target_mtime = target.stat().st_mtime
+        if all(sf.stat().st_mtime <= target_mtime for sf in split_files):
+            return target
+
+    merged = []
+    for sf in split_files:
+        with open(sf, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            merged.extend(data)
+        else:
+            merged.append(data)
+
+    with open(target, 'w', encoding='utf-8') as f:
+        json.dump(merged, f, ensure_ascii=False)
+
+    print_info(
+        f"  Merged {len(split_files)} ChatGPT split files into "
+        f"{target.name} ({len(merged):,} conversations)"
+    )
+    return target
 
 
 # ==============================================================================
@@ -520,9 +562,16 @@ def run_import(
             if acct['name'] else acct['source'].upper()
         )
         exists = acct['path'].exists()
-        status = "[exists]" if exists else "[not found]"
+        n_splits = 0
+        if acct['source'] == 'chatgpt' and not exists:
+            n_splits = len(list(acct['path'].parent.glob('conversations-*.json')))
+        if exists:
+            status, color = "[exists]", "green"
+        elif n_splits:
+            status, color = f"[{n_splits} split files -> will merge]", "yellow"
+        else:
+            status, color = "[not found]", "red"
         if RICH_AVAILABLE:
-            color = "green" if exists else "red"
             console.print(f"  {label}: {acct['path']} [{color}]{status}[/{color}]")
         else:
             print(f"  {label}: {acct['path']} {status}")
@@ -556,6 +605,12 @@ def run_import(
             source = acct['source']
             path = acct['path']
             account_name = acct['name']
+
+            # Auto-merge split ChatGPT exports (conversations-NNN.json) into a
+            # single conversations.json before extraction.
+            if source == 'chatgpt':
+                path = merge_chatgpt_splits(path)
+                acct['path'] = path
 
             if not path.exists():
                 label = (
