@@ -47,3 +47,8 @@ accounts.json
 *.tar.gz
 *.tgz
 .gitnexus
+
+# Tooling / local artifacts
+.serena/
+output-backup/
+slopo.conf.yaml
