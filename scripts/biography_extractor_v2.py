@@ -74,13 +74,13 @@ DEFAULT_API_KEY = "sk-rT24hZlNDy2cbLvF6oPQcklYeESDyouT"
 DEFAULT_MODEL = "gemini-3-flash-preview"
 
 CONCURRENCY = 3
+BATCH_SIZE = 5
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 5.0
 CALL_SPACING = 0.5
 
-# Adaptive context budgets (chars). Start large (Gemini 1M allows it),
-# shrink on truncation. Each level is ~halved.
-CONTEXT_BUDGETS = [800_000, 200_000, 50_000, 25_000]
+# Per-file context budget for single-file fallback.
+SINGLE_FILE_BUDGET = 50_000
 
 SYSTEM_PROMPT = (
     "You are extracting biographical information about the USER from an AI "
@@ -397,7 +397,40 @@ class BiographyExtractorV2:
                     raise
         raise RuntimeError("All retry attempts exhausted")
 
-    def _build_messages(self, content: str, source: str, date: str) -> list[dict]:
+    def _build_batch_messages(self, items: list[dict]) -> list[dict]:
+        """Build a prompt that extracts from multiple conversations at once."""
+        conversations_block = ""
+        for i, item in enumerate(items, 1):
+            conversations_block += (
+                f"\n{'='*40}\n"
+                f"CONVERSATION {i} OF {len(items)}\n"
+                f"SOURCE: {item['source'].upper()} | DATE: {item['date']}\n"
+                f"{'='*40}\n"
+                f"{item['content']}\n"
+            )
+
+        user_prompt = f"""EXTRACTION SCHEMA (per conversation):
+{EXTRACTION_SCHEMA}
+
+RULES:
+- Focus ONLY on information about the USER (the human asking questions)
+- Extract both explicit statements AND reasonable inferences
+- Use empty arrays [] when no relevant information found
+- Be specific: "learning React" not just "programming"
+- "biographical_richness": rate as "high", "medium", "low", or "minimal"
+
+You have {len(items)} conversations below. Output a JSON ARRAY of {len(items)} objects,
+one per conversation, in the SAME ORDER. No other text.
+
+{conversations_block}
+
+JSON ARRAY OUTPUT:"""
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def _build_single_messages(self, content: str, source: str, date: str) -> list[dict]:
         user_prompt = f"""EXTRACTION SCHEMA:
 {EXTRACTION_SCHEMA}
 
@@ -420,80 +453,86 @@ JSON OUTPUT:"""
             {"role": "user", "content": user_prompt},
         ]
 
-    async def extract_biographical_data_async(
+    async def _extract_single(
+        self, client: httpx.AsyncClient, item: dict,
+    ) -> Dict:
+        """Fallback: extract one conversation individually."""
+        content = _truncate_content(item["full_content"], SINGLE_FILE_BUDGET)
+        messages = self._build_single_messages(content, item["source"], item["date"])
+        try:
+            raw, truncated = await self._call_llm(client, messages)
+            if truncated:
+                with self._lock:
+                    self.truncation_count += 1
+                logger.warning("%s truncated even solo", Path(item["file_path"]).name)
+                return self._empty_extraction(item["file_path"], item["source"])
+            parsed = _parse_json_from_text(raw)
+            return self._clean_extraction(parsed)
+        except Exception as e:
+            logger.warning("Solo extraction failed for %s: %s", Path(item["file_path"]).name, e)
+            return self._empty_extraction(item["file_path"], item["source"])
+
+    async def _extract_batch(
         self,
         client: httpx.AsyncClient,
         semaphore: asyncio.Semaphore,
-        file_path: str,
-        source: str,
-    ) -> Dict:
-        """Extract biographical information with adaptive context loading."""
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                full_content = f.read()
-        except Exception as e:
-            logger.error("Failed to read %s: %s", file_path, e)
-            return self._empty_extraction(file_path, source)
+        batch: list[dict],
+        batch_num: int,
+        total_batches: int,
+    ) -> list[Dict]:
+        """Extract biographical data from a batch of conversations in one LLM call.
 
-        idempotency_key = self._generate_idempotency_key(file_path, full_content)
-        content_hash = hashlib.sha256(full_content.encode()).hexdigest()
-
-        cached = self._get_cached_extraction(idempotency_key)
-        if cached:
-            return cached
-
-        conversation_date = self.extract_date_from_filename(file_path)
-
-        # Adaptive context: try with the largest budget first, shrink on truncation
+        Falls back to individual extraction on truncation or parse failure.
+        """
         async with semaphore:
-            extraction = None
-            for budget in CONTEXT_BUDGETS:
-                content = _truncate_content(full_content, budget)
-                messages = self._build_messages(content, source, conversation_date)
+            logger.info("Batch %d/%d (%d files)...", batch_num, total_batches, len(batch))
 
-                try:
-                    raw, truncated = await self._call_llm(client, messages)
-                except Exception as e:
-                    logger.error("LLM call failed for %s: %s", Path(file_path).name, e)
-                    return self._empty_extraction(file_path, source)
+            # Build batch prompt with truncated content per file
+            per_file_budget = 800_000 // max(len(batch), 1)
+            for item in batch:
+                item["content"] = _truncate_content(item["full_content"], per_file_budget)
 
-                if truncated:
-                    with self._lock:
-                        self.truncation_count += 1
-                    logger.warning(
-                        "%s truncated at %dk budget, retrying smaller...",
-                        Path(file_path).name, budget // 1000,
-                    )
-                    continue
+            messages = self._build_batch_messages(batch)
 
-                try:
-                    parsed = _parse_json_from_text(raw)
-                    extraction = self._clean_extraction(parsed)
-                    break
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning("JSON parse failed for %s (%s), retrying smaller...",
-                                   Path(file_path).name, e)
-                    continue
+            try:
+                raw, truncated = await self._call_llm(client, messages)
+            except Exception as e:
+                logger.warning("Batch %d LLM call failed (%s), falling back to individual...", batch_num, e)
+                results = []
+                for item in batch:
+                    results.append(await self._extract_single(client, item))
+                return results
 
-            if extraction is None:
-                logger.error("All context budgets exhausted for %s", Path(file_path).name)
-                return self._empty_extraction(file_path, source)
+            if truncated:
+                with self._lock:
+                    self.truncation_count += 1
+                logger.warning("Batch %d truncated, falling back to individual...", batch_num)
+                results = []
+                for item in batch:
+                    results.append(await self._extract_single(client, item))
+                return results
 
-        extraction["_metadata"] = {
-            "file_path": file_path,
-            "source": source,
-            "conversation_date": conversation_date,
-            "extracted_at": datetime.now().isoformat(),
-            "content_length": len(full_content),
-            "context_budget_used": budget,
-            "provider": f"{self.base_url}|{self.model}",
-        }
+            # Parse the JSON array
+            try:
+                parsed = _parse_json_from_text(raw)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("Batch %d JSON parse failed, falling back to individual...", batch_num)
+                results = []
+                for item in batch:
+                    results.append(await self._extract_single(client, item))
+                return results
 
-        self._save_to_cache(
-            idempotency_key, file_path, content_hash,
-            extraction, source, conversation_date,
-        )
-        return extraction
+            if not isinstance(parsed, list) or len(parsed) != len(batch):
+                logger.warning(
+                    "Batch %d returned %d items (expected %d), falling back...",
+                    batch_num, len(parsed) if isinstance(parsed, list) else 0, len(batch),
+                )
+                results = []
+                for item in batch:
+                    results.append(await self._extract_single(client, item))
+                return results
+
+            return [self._clean_extraction(p) for p in parsed]
 
     def _clean_extraction(self, extracted: Dict) -> Dict:
         cleaned = {}
@@ -562,9 +601,51 @@ JSON OUTPUT:"""
     async def process_all_async(
         self, conversations: List[Tuple[str, str]],
     ) -> List[Dict]:
-        """Process all conversations with async concurrency."""
-        all_extractions: list[Dict] = []
+        """Process conversations: serve from cache, batch uncached via LLM.
 
+        Groups uncached conversations into batches of BATCH_SIZE and sends
+        each batch as one LLM call. Falls back to individual on failure.
+        """
+        all_extractions: dict[str, Dict] = {}  # keyed by file_path for ordering
+        uncached_items: list[dict] = []
+
+        # Phase 1: check cache, collect uncached
+        for file_path, source in conversations:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    full_content = f.read()
+            except Exception as e:
+                logger.error("Failed to read %s: %s", file_path, e)
+                all_extractions[file_path] = self._empty_extraction(file_path, source)
+                continue
+
+            idempotency_key = self._generate_idempotency_key(file_path, full_content)
+            cached = self._get_cached_extraction(idempotency_key)
+            if cached:
+                all_extractions[file_path] = cached
+            else:
+                uncached_items.append({
+                    "file_path": file_path,
+                    "source": source,
+                    "full_content": full_content,
+                    "content_hash": hashlib.sha256(full_content.encode()).hexdigest(),
+                    "idempotency_key": idempotency_key,
+                    "date": self.extract_date_from_filename(file_path),
+                })
+
+        console.print(
+            f"[blue]Cache: {len(all_extractions)} hits, "
+            f"{len(uncached_items)} to extract in ~{(len(uncached_items) + BATCH_SIZE - 1) // BATCH_SIZE} batches[/blue]"
+        )
+
+        if not uncached_items:
+            return [all_extractions[fp] for fp, _ in conversations if fp in all_extractions]
+
+        # Phase 2: batch uncached into LLM calls
+        batches = [
+            uncached_items[i:i + BATCH_SIZE]
+            for i in range(0, len(uncached_items), BATCH_SIZE)
+        ]
         semaphore = asyncio.Semaphore(CONCURRENCY)
 
         with Progress(
@@ -575,24 +656,39 @@ JSON OUTPUT:"""
             console=console,
         ) as progress:
             task = progress.add_task(
-                f"[cyan]Extracting via {self.model}...", total=len(conversations)
+                f"[cyan]Extracting via {self.model} ({len(batches)} batches)...",
+                total=len(uncached_items),
             )
 
             async with httpx.AsyncClient() as client:
-                async def _process_one(file_path: str, source: str):
-                    result = await self.extract_biographical_data_async(
-                        client, semaphore, file_path, source,
+                async def _process_batch(batch: list[dict], batch_num: int):
+                    results = await self._extract_batch(
+                        client, semaphore, batch, batch_num, len(batches),
                     )
-                    all_extractions.append(result)
-                    progress.advance(task)
+                    for item, extraction in zip(batch, results):
+                        extraction["_metadata"] = {
+                            "file_path": item["file_path"],
+                            "source": item["source"],
+                            "conversation_date": item["date"],
+                            "extracted_at": datetime.now().isoformat(),
+                            "content_length": len(item["full_content"]),
+                            "provider": f"{self.base_url}|{self.model}",
+                        }
+                        self._save_to_cache(
+                            item["idempotency_key"], item["file_path"],
+                            item["content_hash"], extraction,
+                            item["source"], item["date"],
+                        )
+                        all_extractions[item["file_path"]] = extraction
+                        progress.advance(task)
 
-                tasks = [
-                    _process_one(file_path, source)
-                    for file_path, source in conversations
+                batch_tasks = [
+                    _process_batch(batch, i + 1)
+                    for i, batch in enumerate(batches)
                 ]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*batch_tasks, return_exceptions=True)
 
-        return all_extractions
+        return [all_extractions.get(fp, self._empty_extraction(fp, src)) for fp, src in conversations]
 
     def print_statistics(self, extractions: List[Dict]):
         console.print()
