@@ -2,29 +2,41 @@
 # /// script
 # dependencies = [
 #   "rich",
+#   "httpx",
 # ]
 # requires-python = ">=3.11"
 # ///
 
 """
-Biographical Profile Extractor v2 - Multi-Model Support
-========================================================
+Biographical Profile Extractor v2 - OpenAI-Compatible API
+=========================================================
 
-Supports Claude, Gemini, and Codex (OpenAI) backends to distribute
-load and avoid exhausting any single provider's usage limits.
+Extracts biographical information from AI conversation markdown files
+using any OpenAI-compatible endpoint (agy/Gemini proxy, NVIDIA NIM,
+Ollama Cloud, etc.) via direct HTTP — no CLI tools required.
+
+Adaptive context loading: with large-context models (Gemini 1M+),
+the full conversation is sent. The content budget adapts based on
+the model's context window and truncation feedback.
 
 Usage:
-    # Use Claude (default)
-    python3 scripts/biography_extractor_v2.py --all-sources --provider claude
+    # Default: agy provider (local Gemini proxy)
+    uv run scripts/biography_extractor_v2.py --all-sources
 
-    # Use Gemini
-    python3 scripts/biography_extractor_v2.py --all-sources --provider gemini
+    # Custom endpoint
+    uv run scripts/biography_extractor_v2.py --all-sources \\
+        --base-url https://integrate.api.nvidia.com/v1 \\
+        --api-key nvapi-xxx --model deepseek-ai/deepseek-v4-flash
 
-    # Use Codex (OpenAI)
-    python3 scripts/biography_extractor_v2.py --all-sources --provider codex
+    # Sample mode (test with N files)
+    uv run scripts/biography_extractor_v2.py --all-sources --sample 5
 
-    # Specify model within provider
-    python3 scripts/biography_extractor_v2.py --all-sources --provider gemini --model gemini-2.0-flash
+    # Export extractions to JSON
+    uv run scripts/biography_extractor_v2.py --all-sources \\
+        --export output/profile/data/extractions.json
+
+    # Export all cached extractions (no API calls)
+    uv run scripts/biography_extractor_v2.py --export-cached
 """
 
 import json
@@ -32,66 +44,186 @@ import argparse
 import hashlib
 import sqlite3
 import pickle
-import subprocess
 import re
+import os
 import asyncio
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
+
+import httpx
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.table import Table
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
 console = Console()
 
-# Conversation directories to scan
 CONVERSATION_DIRS = [
     "output/chatgpt-full/conversations",
     "output/claude-full/conversations",
     "output/gemini/conversations",
 ]
 
-# Provider configurations
-PROVIDERS = {
-    "claude": {
-        "cmd": ["claude", "--print", "--model", "{model}", "--tools", "", "--output-format", "json"],
-        "default_model": "haiku",
-        "parse_response": "claude",
+# Defaults: agy proxy (local Gemini endpoint, OpenAI-compatible)
+DEFAULT_BASE_URL = "http://127.0.0.1:8317/v1"
+DEFAULT_API_KEY = "sk-rT24hZlNDy2cbLvF6oPQcklYeESDyouT"
+DEFAULT_MODEL = "gemini-3-flash-preview"
+
+CONCURRENCY = 3
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 5.0
+CALL_SPACING = 0.5
+
+# Adaptive context budgets (chars). Start large (Gemini 1M allows it),
+# shrink on truncation. Each level is ~halved.
+CONTEXT_BUDGETS = [800_000, 200_000, 50_000, 25_000]
+
+SYSTEM_PROMPT = (
+    "You are extracting biographical information about the USER from an AI "
+    "conversation. Focus on learning about the person who is asking questions "
+    "or making requests. Output valid JSON only — no markdown, no explanation, "
+    "no code blocks."
+)
+
+EXTRACTION_SCHEMA = """{
+    "identity": {
+        "name_mentions": [],
+        "location_mentions": [],
+        "language_indicators": [],
+        "demographic_hints": []
     },
-    "gemini": {
-        "cmd": ["gemini", "-o", "json", "-m", "{model}"],
-        "default_model": "gemini-2.5-flash",
-        "parse_response": "gemini",
+    "work": {
+        "occupation_hints": [],
+        "projects_mentioned": [],
+        "skills_demonstrated": [],
+        "business_ventures": [],
+        "work_style": []
     },
-    "codex": {
-        "cmd": ["codex", "exec", "-m", "{model}"],
-        "default_model": "gpt-4.1-mini",  # Use --model to override with gpt-5.1-codex-max
-        "parse_response": "codex",
+    "health": {
+        "physical_health": [],
+        "mental_health": [],
+        "sleep_patterns": [],
+        "nutrition_diet": [],
+        "substances": [],
+        "medications": []
     },
-}
+    "relationships": {
+        "romantic": [],
+        "family": [],
+        "social": [],
+        "sexuality": []
+    },
+    "interests": {
+        "hobbies": [],
+        "intellectual": [],
+        "entertainment": [],
+        "creative": []
+    },
+    "goals": {
+        "short_term": [],
+        "long_term": [],
+        "dreams": [],
+        "fears": []
+    },
+    "challenges": {
+        "current_problems": [],
+        "recurring_patterns": [],
+        "blockers": [],
+        "seeking_help_for": []
+    },
+    "daily_life": {
+        "routines": [],
+        "tools_apps": [],
+        "living_situation": [],
+        "finances": []
+    },
+    "values": {
+        "explicit_values": [],
+        "implicit_values": [],
+        "philosophical": [],
+        "political_social": []
+    },
+    "context": {
+        "main_topic": "",
+        "emotional_tone": "",
+        "biographical_richness": ""
+    }
+}"""
+
+
+def _truncate_content(content: str, budget: int) -> str:
+    """Truncate content to fit within a character budget.
+
+    For budgets large enough to hold the full content, returns as-is.
+    Otherwise takes the first half and last half of the budget, joined
+    by a marker so the model knows content was omitted.
+    """
+    if len(content) <= budget:
+        return content
+    half = budget // 2
+    return content[:half] + "\n\n[... middle content omitted for context budget ...]\n\n" + content[-half:]
+
+
+def _strip_markdown_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1:]
+        if text.endswith("```"):
+            text = text[:-3].rstrip()
+    return text
+
+
+def _parse_json_from_text(text: str) -> dict:
+    """Extract JSON from a text response, handling markdown fences and comments."""
+    text = _strip_markdown_fences(text)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    json_start = text.find("{")
+    json_end = text.rfind("}") + 1
+    if json_start != -1 and json_end > json_start:
+        json_str = text[json_start:json_end]
+        json_str = re.sub(r"//.*$", "", json_str, flags=re.MULTILINE)
+        json_str = re.sub(r"/\*.*?\*/", "", json_str, flags=re.DOTALL)
+        return json.loads(json_str)
+
+    raise ValueError("No valid JSON found in response")
 
 
 class BiographyExtractorV2:
-    def __init__(self, cache_file: str = "biography_cache.db", provider: str = "claude", model: str = None):
+    def __init__(
+        self,
+        cache_file: str = "biography_cache.db",
+        base_url: str = DEFAULT_BASE_URL,
+        api_key: str = DEFAULT_API_KEY,
+        model: str = DEFAULT_MODEL,
+    ):
         self.cache_file = cache_file
         self.cache_hits = 0
         self.cache_misses = 0
-        self.provider = provider
-        self.provider_config = PROVIDERS.get(provider, PROVIDERS["claude"])
-        self.model = model or self.provider_config["default_model"]
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.truncation_count = 0
         import threading
         self._lock = threading.Lock()
         self._init_cache()
 
-        console.print(f"[cyan]Using provider: {provider}" + (f" (model: {self.model})" if self.model else "") + "[/cyan]")
+        console.print(f"[cyan]Endpoint: {self.base_url} | Model: {self.model}[/cyan]")
 
     def _get_connection(self):
-        """Get a thread-local database connection"""
         return sqlite3.connect(self.cache_file)
 
     def _init_cache(self):
-        """Initialize SQLite cache for biographical extractions"""
         conn = self._get_connection()
         conn.execute("PRAGMA journal_mode=WAL")
         cursor = conn.cursor()
@@ -108,30 +240,24 @@ class BiographyExtractorV2:
                 provider TEXT
             )
         """)
-
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_file_path
             ON biography_cache(file_path)
         """)
-
         conn.commit()
 
         cursor.execute("SELECT COUNT(*) FROM biography_cache")
         cache_count = cursor.fetchone()[0]
         if cache_count > 0:
-            console.print(f"[blue]Using cache with {cache_count} existing extractions[/blue]")
-
+            console.print(f"[blue]Cache: {cache_count} existing extractions[/blue]")
         conn.close()
 
     def _generate_idempotency_key(self, file_path: str, content: str) -> str:
-        """Generate unique key based on file path and content hash"""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
-        key_parts = [file_path, content_hash]
-        combined = "|".join(key_parts)
+        combined = f"{file_path}|{content_hash}"
         return hashlib.sha256(combined.encode()).hexdigest()
 
     def _get_cached_extraction(self, idempotency_key: str) -> Optional[Dict]:
-        """Retrieve cached extraction if exists"""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -142,7 +268,7 @@ class BiographyExtractorV2:
             result = cursor.fetchone()
             conn.close()
         except Exception as e:
-            console.print(f"[yellow]Cache read failed: {e}[/yellow]")
+            logger.warning("Cache read failed: %s", e)
             return None
 
         if result:
@@ -163,7 +289,6 @@ class BiographyExtractorV2:
         source: str,
         conversation_date: str,
     ):
-        """Save extraction to cache"""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -173,7 +298,7 @@ class BiographyExtractorV2:
                 (idempotency_key, file_path, content_hash, extraction_data,
                  created_at, source, conversation_date, provider)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+                """,
                 (
                     idempotency_key,
                     file_path,
@@ -182,18 +307,16 @@ class BiographyExtractorV2:
                     datetime.now().isoformat(),
                     source,
                     conversation_date,
-                    self.provider,
+                    f"{self.base_url}|{self.model}",
                 ),
             )
             conn.commit()
             conn.close()
         except Exception as e:
-            console.print(f"[yellow]Failed to save to cache: {e}[/yellow]")
+            logger.warning("Cache write failed: %s", e)
 
     def discover_conversations(self, directories: List[str]) -> List[Tuple[str, str]]:
-        """Discover all conversation markdown files"""
         conversations = []
-
         for directory in directories:
             dir_path = Path(directory)
             if not dir_path.exists():
@@ -209,9 +332,10 @@ class BiographyExtractorV2:
             else:
                 source = "unknown"
 
-            md_files = list(dir_path.glob("*.md"))
-            md_files = [f for f in md_files if not f.name.upper().startswith("INDEX")]
-
+            md_files = [
+                f for f in dir_path.glob("*.md")
+                if not f.name.upper().startswith("INDEX")
+            ]
             for md_file in md_files:
                 conversations.append((str(md_file), source))
 
@@ -219,141 +343,69 @@ class BiographyExtractorV2:
         return conversations
 
     def extract_date_from_filename(self, filename: str) -> str:
-        """Extract date from YYYYMMDD_title.md format"""
         name = Path(filename).stem
         match = re.match(r"(\d{8})", name)
         if match:
-            date_str = match.group(1)
             try:
-                date = datetime.strptime(date_str, "%Y%m%d")
+                date = datetime.strptime(match.group(1), "%Y%m%d")
                 return date.strftime("%Y-%m-%d")
             except ValueError:
                 pass
         return "unknown"
 
-    def extract_biographical_data(self, file_path: str, source: str) -> Dict:
-        """Extract biographical information from a conversation file"""
+    async def _call_llm(
+        self,
+        client: httpx.AsyncClient,
+        messages: list[dict],
+    ) -> tuple[str, bool]:
+        """Call OpenAI-compatible chat/completions. Returns (content, was_truncated)."""
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "temperature": 0.2,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=300.0,
+                )
+                if resp.status_code in (429, 500, 502, 503):
+                    wait = RETRY_DELAY * (2 ** attempt)
+                    logger.warning("Server %d, waiting %.1fs (attempt %d/%d)...",
+                                   resp.status_code, wait, attempt + 1, RETRY_ATTEMPTS)
+                    await asyncio.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                choice = data["choices"][0]
+                content = choice["message"]["content"]
+                truncated = choice.get("finish_reason") == "length"
+                await asyncio.sleep(CALL_SPACING)
+                return content, truncated
+            except (httpx.HTTPStatusError, httpx.ReadTimeout, KeyError) as e:
+                if attempt < RETRY_ATTEMPTS - 1:
+                    wait = RETRY_DELAY * (2 ** attempt)
+                    logger.warning("Attempt %d failed (%s), retrying in %.1fs...",
+                                   attempt + 1, e, wait)
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+        raise RuntimeError("All retry attempts exhausted")
 
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            console.print(f"[red]Failed to read {file_path}: {e}[/red]")
-            return self._empty_extraction(file_path, source)
-
-        idempotency_key = self._generate_idempotency_key(file_path, content)
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-
-        cached = self._get_cached_extraction(idempotency_key)
-        if cached:
-            return cached
-
-        conversation_date = self.extract_date_from_filename(file_path)
-
-        max_chars = 25000
-        if len(content) > max_chars:
-            content = content[:12000] + "\n\n[... middle content omitted ...]\n\n" + content[-12000:]
-
-        prompt = self._create_extraction_prompt(content, source, conversation_date)
-        extraction = self._call_provider(prompt)
-
-        extraction["_metadata"] = {
-            "file_path": file_path,
-            "source": source,
-            "conversation_date": conversation_date,
-            "extracted_at": datetime.now().isoformat(),
-            "content_length": len(content),
-            "provider": self.provider,
-        }
-
-        self._save_to_cache(
-            idempotency_key,
-            file_path,
-            content_hash,
-            extraction,
-            source,
-            conversation_date,
-        )
-
-        return extraction
-
-    def _create_extraction_prompt(self, content: str, source: str, date: str) -> str:
-        """Create the biographical extraction prompt"""
-        return f"""You are extracting biographical information about the USER from an AI conversation.
-Focus on learning about the person who is asking questions/making requests.
-
-OUTPUT FORMAT: Valid JSON only. No markdown, no explanation, no code blocks. Just raw JSON.
-
-EXTRACTION SCHEMA:
-{{
-    "identity": {{
-        "name_mentions": [],
-        "location_mentions": [],
-        "language_indicators": [],
-        "demographic_hints": []
-    }},
-    "work": {{
-        "occupation_hints": [],
-        "projects_mentioned": [],
-        "skills_demonstrated": [],
-        "business_ventures": [],
-        "work_style": []
-    }},
-    "health": {{
-        "physical_health": [],
-        "mental_health": [],
-        "sleep_patterns": [],
-        "nutrition_diet": [],
-        "substances": [],
-        "medications": []
-    }},
-    "relationships": {{
-        "romantic": [],
-        "family": [],
-        "social": [],
-        "sexuality": []
-    }},
-    "interests": {{
-        "hobbies": [],
-        "intellectual": [],
-        "entertainment": [],
-        "creative": []
-    }},
-    "goals": {{
-        "short_term": [],
-        "long_term": [],
-        "dreams": [],
-        "fears": []
-    }},
-    "challenges": {{
-        "current_problems": [],
-        "recurring_patterns": [],
-        "blockers": [],
-        "seeking_help_for": []
-    }},
-    "daily_life": {{
-        "routines": [],
-        "tools_apps": [],
-        "living_situation": [],
-        "finances": []
-    }},
-    "values": {{
-        "explicit_values": [],
-        "implicit_values": [],
-        "philosophical": [],
-        "political_social": []
-    }},
-    "context": {{
-        "main_topic": "",
-        "emotional_tone": "",
-        "biographical_richness": ""
-    }}
-}}
+    def _build_messages(self, content: str, source: str, date: str) -> list[dict]:
+        user_prompt = f"""EXTRACTION SCHEMA:
+{EXTRACTION_SCHEMA}
 
 RULES:
 - Focus ONLY on information about the USER (the human asking questions)
 - Extract both explicit statements AND reasonable inferences
 - Use empty arrays [] when no relevant information found
+- Be specific: "learning React" not just "programming"
 - "biographical_richness": rate as "high", "medium", "low", or "minimal"
 
 SOURCE: {source.upper()}
@@ -363,140 +415,88 @@ CONVERSATION:
 {content}
 
 JSON OUTPUT:"""
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
 
-    def _call_provider(self, prompt: str) -> Dict:
-        """Call the configured provider for extraction"""
-        max_retries = 2
-
-        for attempt in range(max_retries):
-            try:
-                if self.provider == "claude":
-                    return self._call_claude(prompt)
-                elif self.provider == "gemini":
-                    return self._call_gemini(prompt)
-                elif self.provider == "codex":
-                    return self._call_codex(prompt)
-                else:
-                    console.print(f"[red]Unknown provider: {self.provider}[/red]")
-                    return self._empty_extraction_data()
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    console.print(f"[yellow]Retry {attempt + 1}: {e}[/yellow]")
-                    continue
-                console.print(f"[yellow]Extraction error: {e}[/yellow]")
-
-        return self._empty_extraction_data()
-
-    def _call_claude(self, prompt: str) -> Dict:
-        """Call Claude CLI"""
-        cmd = ["claude", "--print", "--model", self.model or "haiku", "--tools", "", "--output-format", "json"]
-
-        result = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-
-        if result.returncode == 0:
-            response_text = result.stdout.strip()
-            try:
-                wrapper = json.loads(response_text)
-                inner_result = wrapper.get("result", "")
-
-                if inner_result.startswith("```"):
-                    inner_result = re.sub(r"^```(?:json)?\s*", "", inner_result)
-                    inner_result = re.sub(r"\s*```$", "", inner_result)
-
-                return self._clean_extraction(json.loads(inner_result))
-            except json.JSONDecodeError:
-                return self._parse_json_from_text(response_text)
-
-        raise ValueError(f"Claude CLI error: {result.stderr}")
-
-    def _call_gemini(self, prompt: str) -> Dict:
-        """Call Gemini CLI"""
-        cmd = ["gemini", "-o", "json"]
-        if self.model:
-            cmd.extend(["-m", self.model])
-
-        result = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-        if result.returncode == 0:
-            response_text = result.stdout.strip()
-            try:
-                # Gemini JSON output format
-                wrapper = json.loads(response_text)
-                # Extract the actual response - may be in different fields
-                if isinstance(wrapper, dict):
-                    content = wrapper.get("response", wrapper.get("result", wrapper.get("text", "")))
-                    if isinstance(content, str):
-                        return self._parse_json_from_text(content)
-                    elif isinstance(content, dict):
-                        return self._clean_extraction(content)
-                return self._parse_json_from_text(response_text)
-            except json.JSONDecodeError:
-                return self._parse_json_from_text(response_text)
-
-        raise ValueError(f"Gemini CLI error: {result.stderr}")
-
-    def _call_codex(self, prompt: str) -> Dict:
-        """Call Codex CLI"""
-        cmd = ["codex", "exec"]
-        if self.model:
-            cmd.extend(["-m", self.model])
-
-        result = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-        if result.returncode == 0:
-            response_text = result.stdout.strip()
-            return self._parse_json_from_text(response_text)
-
-        raise ValueError(f"Codex CLI error: {result.stderr}")
-
-    def _parse_json_from_text(self, text: str) -> Dict:
-        """Extract JSON from text response"""
-        # Remove markdown code blocks
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-        # Try direct parse
+    async def extract_biographical_data_async(
+        self,
+        client: httpx.AsyncClient,
+        semaphore: asyncio.Semaphore,
+        file_path: str,
+        source: str,
+    ) -> Dict:
+        """Extract biographical information with adaptive context loading."""
         try:
-            return self._clean_extraction(json.loads(text))
-        except json.JSONDecodeError:
-            pass
+            with open(file_path, "r", encoding="utf-8") as f:
+                full_content = f.read()
+        except Exception as e:
+            logger.error("Failed to read %s: %s", file_path, e)
+            return self._empty_extraction(file_path, source)
 
-        # Find JSON in text
-        json_start = text.find("{")
-        json_end = text.rfind("}") + 1
-        if json_start != -1 and json_end > json_start:
-            json_str = text[json_start:json_end]
-            json_str = re.sub(r"//.*$", "", json_str, flags=re.MULTILINE)
-            json_str = re.sub(r"/\*.*?\*/", "", json_str, flags=re.DOTALL)
-            try:
-                return self._clean_extraction(json.loads(json_str))
-            except json.JSONDecodeError:
-                pass
+        idempotency_key = self._generate_idempotency_key(file_path, full_content)
+        content_hash = hashlib.sha256(full_content.encode()).hexdigest()
 
-        raise ValueError("No valid JSON found in response")
+        cached = self._get_cached_extraction(idempotency_key)
+        if cached:
+            return cached
+
+        conversation_date = self.extract_date_from_filename(file_path)
+
+        # Adaptive context: try with the largest budget first, shrink on truncation
+        async with semaphore:
+            extraction = None
+            for budget in CONTEXT_BUDGETS:
+                content = _truncate_content(full_content, budget)
+                messages = self._build_messages(content, source, conversation_date)
+
+                try:
+                    raw, truncated = await self._call_llm(client, messages)
+                except Exception as e:
+                    logger.error("LLM call failed for %s: %s", Path(file_path).name, e)
+                    return self._empty_extraction(file_path, source)
+
+                if truncated:
+                    with self._lock:
+                        self.truncation_count += 1
+                    logger.warning(
+                        "%s truncated at %dk budget, retrying smaller...",
+                        Path(file_path).name, budget // 1000,
+                    )
+                    continue
+
+                try:
+                    parsed = _parse_json_from_text(raw)
+                    extraction = self._clean_extraction(parsed)
+                    break
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning("JSON parse failed for %s (%s), retrying smaller...",
+                                   Path(file_path).name, e)
+                    continue
+
+            if extraction is None:
+                logger.error("All context budgets exhausted for %s", Path(file_path).name)
+                return self._empty_extraction(file_path, source)
+
+        extraction["_metadata"] = {
+            "file_path": file_path,
+            "source": source,
+            "conversation_date": conversation_date,
+            "extracted_at": datetime.now().isoformat(),
+            "content_length": len(full_content),
+            "context_budget_used": budget,
+            "provider": f"{self.base_url}|{self.model}",
+        }
+
+        self._save_to_cache(
+            idempotency_key, file_path, content_hash,
+            extraction, source, conversation_date,
+        )
+        return extraction
 
     def _clean_extraction(self, extracted: Dict) -> Dict:
-        """Clean and validate extracted data"""
         cleaned = {}
-
         categories = {
             "identity": ["name_mentions", "location_mentions", "language_indicators", "demographic_hints"],
             "work": ["occupation_hints", "projects_mentioned", "skills_demonstrated", "business_ventures", "work_style"],
@@ -509,17 +509,17 @@ JSON OUTPUT:"""
             "values": ["explicit_values", "implicit_values", "philosophical", "political_social"],
             "context": ["main_topic", "emotional_tone", "biographical_richness"],
         }
+        string_fields = {"main_topic", "emotional_tone", "biographical_richness"}
 
         for category, fields in categories.items():
-            if category not in cleaned:
-                cleaned[category] = {}
-
+            cleaned[category] = {}
             cat_data = extracted.get(category, {})
             if not isinstance(cat_data, dict):
                 cat_data = {}
 
             for field in fields:
-                value = cat_data.get(field, [] if field not in ["main_topic", "emotional_tone", "biographical_richness"] else "")
+                default = "" if field in string_fields else []
+                value = cat_data.get(field, default)
 
                 if isinstance(value, list):
                     cleaned[category][field] = [
@@ -533,7 +533,6 @@ JSON OUTPUT:"""
         return cleaned
 
     def _empty_extraction_data(self) -> Dict:
-        """Return empty extraction structure"""
         return {
             "identity": {"name_mentions": [], "location_mentions": [], "language_indicators": [], "demographic_hints": []},
             "work": {"occupation_hints": [], "projects_mentioned": [], "skills_demonstrated": [], "business_ventures": [], "work_style": []},
@@ -548,7 +547,6 @@ JSON OUTPUT:"""
         }
 
     def _empty_extraction(self, file_path: str, source: str) -> Dict:
-        """Return empty extraction with metadata"""
         extraction = self._empty_extraction_data()
         extraction["_metadata"] = {
             "file_path": file_path,
@@ -557,15 +555,17 @@ JSON OUTPUT:"""
             "extracted_at": datetime.now().isoformat(),
             "content_length": 0,
             "error": True,
-            "provider": self.provider,
+            "provider": f"{self.base_url}|{self.model}",
         }
         return extraction
 
-    async def process_batch_async(
-        self, conversations: List[Tuple[str, str]], batch_size: int = 3
+    async def process_all_async(
+        self, conversations: List[Tuple[str, str]],
     ) -> List[Dict]:
-        """Process conversations in batches"""
-        all_extractions = []
+        """Process all conversations with async concurrency."""
+        all_extractions: list[Dict] = []
+
+        semaphore = asyncio.Semaphore(CONCURRENCY)
 
         with Progress(
             SpinnerColumn(),
@@ -575,40 +575,36 @@ JSON OUTPUT:"""
             console=console,
         ) as progress:
             task = progress.add_task(
-                f"[cyan]Extracting via {self.provider}...", total=len(conversations)
+                f"[cyan]Extracting via {self.model}...", total=len(conversations)
             )
 
-            for i in range(0, len(conversations), batch_size):
-                batch = conversations[i : i + batch_size]
+            async with httpx.AsyncClient() as client:
+                async def _process_one(file_path: str, source: str):
+                    result = await self.extract_biographical_data_async(
+                        client, semaphore, file_path, source,
+                    )
+                    all_extractions.append(result)
+                    progress.advance(task)
 
-                with ThreadPoolExecutor(max_workers=batch_size) as executor:
-                    futures = [
-                        executor.submit(self.extract_biographical_data, file_path, source)
-                        for file_path, source in batch
-                    ]
-
-                    for future in futures:
-                        try:
-                            extraction = future.result(timeout=180)
-                            all_extractions.append(extraction)
-                        except Exception as e:
-                            console.print(f"[red]Batch error: {e}[/red]")
-
-                        progress.advance(task)
+                tasks = [
+                    _process_one(file_path, source)
+                    for file_path, source in conversations
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         return all_extractions
 
     def print_statistics(self, extractions: List[Dict]):
-        """Print extraction statistics"""
         console.print()
 
-        table = Table(title=f"Extraction Statistics ({self.provider})")
+        table = Table(title=f"Extraction Statistics ({self.model})")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green")
 
         table.add_row("Total conversations", str(len(extractions)))
         table.add_row("Cache hits", str(self.cache_hits))
-        table.add_row("Cache misses", str(self.cache_misses))
+        table.add_row("Cache misses (API calls)", str(self.cache_misses))
+        table.add_row("Truncation retries", str(self.truncation_count))
 
         if self.cache_hits + self.cache_misses > 0:
             hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses) * 100
@@ -617,10 +613,7 @@ JSON OUTPUT:"""
         richness_counts = {"high": 0, "medium": 0, "low": 0, "minimal": 0}
         for ext in extractions:
             richness = ext.get("context", {}).get("biographical_richness", "minimal").lower()
-            if richness in richness_counts:
-                richness_counts[richness] += 1
-            else:
-                richness_counts["minimal"] += 1
+            richness_counts[richness] = richness_counts.get(richness, 0) + 1
 
         table.add_row("High richness", str(richness_counts["high"]))
         table.add_row("Medium richness", str(richness_counts["medium"]))
@@ -629,14 +622,21 @@ JSON OUTPUT:"""
 
         console.print(table)
 
+        source_counts: dict[str, int] = {}
+        for ext in extractions:
+            source = ext.get("_metadata", {}).get("source", "unknown")
+            source_counts[source] = source_counts.get(source, 0) + 1
+        console.print("\n[bold]By Source:[/bold]")
+        for source, count in sorted(source_counts.items()):
+            console.print(f"  {source}: {count}")
+
     def export_to_json(self, extractions: List[Dict], output_file: str):
-        """Export all extractions to JSON file"""
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(extractions, f, indent=2, ensure_ascii=False)
         console.print(f"[green]Exported {len(extractions)} extractions to {output_file}[/green]")
 
     def get_all_cached_extractions(self) -> List[Dict]:
-        """Retrieve all cached extractions from database"""
         conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -644,34 +644,48 @@ JSON OUTPUT:"""
         )
         results = cursor.fetchall()
         conn.close()
-
-        extractions = []
-        for row in results:
-            extraction = pickle.loads(row[0])
-            extractions.append(extraction)
-
-        return extractions
+        return [pickle.loads(row[0]) for row in results]
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Extract biographical information using multiple AI providers")
-    parser.add_argument("directory", nargs="?", help="Directory containing conversation markdown files")
+    parser = argparse.ArgumentParser(
+        description="Extract biographical information via OpenAI-compatible API",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Environment variables (override CLI defaults):
+  BIO_BASE_URL   API base URL (default: http://127.0.0.1:8317/v1)
+  BIO_API_KEY    API key
+  BIO_MODEL      Model name (default: gemini-3-flash-preview)
+
+Examples:
+  uv run scripts/biography_extractor_v2.py --all-sources
+  uv run scripts/biography_extractor_v2.py --all-sources --sample 5
+  uv run scripts/biography_extractor_v2.py --export-cached --export output/profile/data/extractions.json
+        """,
+    )
+    parser.add_argument("directory", nargs="?", help="Directory with conversation markdown files")
     parser.add_argument("--all-sources", action="store_true", help="Process all conversation sources")
     parser.add_argument("--sample", type=int, help="Only process N random conversations")
     parser.add_argument("--export", type=str, help="Export extractions to JSON file")
     parser.add_argument("--cache-file", type=str, default="biography_cache.db", help="Cache database file")
-    parser.add_argument("--batch-size", type=int, default=3, help="Parallel batch size")
-    parser.add_argument("--export-cached", action="store_true", help="Export all cached extractions")
-    parser.add_argument("--provider", type=str, default="claude", choices=["claude", "gemini", "codex"],
-                       help="AI provider to use (claude, gemini, codex)")
-    parser.add_argument("--model", type=str, help="Model to use (provider-specific)")
+    parser.add_argument("--export-cached", action="store_true", help="Export all cached extractions (no API calls)")
+    parser.add_argument("--base-url", type=str,
+                        default=os.environ.get("BIO_BASE_URL", DEFAULT_BASE_URL),
+                        help="OpenAI-compatible API base URL")
+    parser.add_argument("--api-key", type=str,
+                        default=os.environ.get("BIO_API_KEY", DEFAULT_API_KEY),
+                        help="API key for the endpoint")
+    parser.add_argument("--model", type=str,
+                        default=os.environ.get("BIO_MODEL", DEFAULT_MODEL),
+                        help="Model name to use")
 
     args = parser.parse_args()
 
     extractor = BiographyExtractorV2(
         cache_file=args.cache_file,
-        provider=args.provider,
-        model=args.model
+        base_url=args.base_url,
+        api_key=args.api_key,
+        model=args.model,
     )
 
     if args.export_cached:
@@ -701,7 +715,7 @@ async def main():
         conversations = random.sample(conversations, min(args.sample, len(conversations)))
         console.print(f"[blue]Sampling {len(conversations)} conversations[/blue]")
 
-    extractions = await extractor.process_batch_async(conversations, batch_size=args.batch_size)
+    extractions = await extractor.process_all_async(conversations)
     extractor.print_statistics(extractions)
 
     if args.export:
