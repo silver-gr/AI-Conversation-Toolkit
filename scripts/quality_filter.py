@@ -19,8 +19,8 @@ from datetime import datetime
 try:
     import yaml
 except ImportError:
-    os.system("pip3 install pyyaml -q")
-    import yaml
+    print("ERROR: pyyaml is required. Install with: pip3 install pyyaml")
+    sys.exit(1)
 
 # ─── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -225,6 +225,15 @@ def score_conversation(filepath: Path, source: str) -> tuple[int, list[str], boo
     elif messages <= 14: msg_adj = +10
     else:                msg_adj = +15
 
+    # Content-density correction: a single-message conversation with
+    # substantial content (e.g. a long code dump or detailed prompt) is
+    # not "empty" — soften the harsh msgs=1 penalty proportionally.
+    if messages <= 1 and characters >= 3000:
+        density_relief = min(20, (characters - 3000) // 500)
+        msg_adj += density_relief
+        if density_relief:
+            reasons.append(f"density relief ({characters}c in 1 msg) → +{density_relief}")
+
     if msg_adj != 0:
         score += msg_adj
         reasons.append(f"msgs={messages} → {msg_adj:+d}")
@@ -344,11 +353,11 @@ def run_filter(dry_run: bool = False, verbose: bool = False, threshold: int = MI
         print(f"  Kept: {src_kept}, Excluded: {src_excl}")
 
     # ── Summary ─────────────────────────────────────────────────────────────
-    total = stats["total"]
+    total = stats["total"] or 1  # guard against division by zero
     print(f"\n{'='*60}")
     print(f"SUMMARY")
     print(f"{'='*60}")
-    print(f"Total conversations:     {total}")
+    print(f"Total conversations:     {stats['total']}")
     print(f"Kept for UltraRAG:      {stats['kept']} ({stats['kept']/total*100:.1f}%)")
     print(f"  • Force-kept total:   {stats['force_kept']}")
     print(f"    - Research convos:  {stats['research_kept']}")
@@ -377,7 +386,7 @@ def write_report(report_path: Path, excluded: list, kept: list, stats: dict, dry
         "",
         "| Metric | Count |",
         "|--------|-------|",
-        f"| Total conversations | {total} |",
+        f"| Total conversations | {stats['total']} |",
         f"| Kept for UltraRAG | {stats['kept']} ({stats['kept']/total*100:.1f}%) |",
         f"| Force-kept (research) | {stats['research_kept']} |",
         f"| Force-kept (long content) | {stats['long_kept']} |",
@@ -420,10 +429,45 @@ def write_report(report_path: Path, excluded: list, kept: list, stats: dict, dry
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
+def restore_excluded():
+    """Move all files from _excluded/ back to their source conversation dirs."""
+    if not EXCLUDED_DIR.exists():
+        print("Nothing to restore: _excluded/ does not exist.")
+        return
+
+    restored = 0
+    for source_key, (conv_dir, folder_name) in SOURCES.items():
+        excl_dir = EXCLUDED_DIR / folder_name
+        if not excl_dir.exists():
+            continue
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        for fp in excl_dir.glob("*.md"):
+            dest = conv_dir / fp.name
+            if dest.exists():
+                print(f"  SKIP (already exists): {fp.name}")
+                continue
+            shutil.move(str(fp), str(dest))
+            restored += 1
+
+    # Clean up empty _excluded subdirs
+    for d in EXCLUDED_DIR.iterdir():
+        if d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+    if EXCLUDED_DIR.exists() and not any(EXCLUDED_DIR.iterdir()):
+        EXCLUDED_DIR.rmdir()
+
+    print(f"Restored {restored} files from _excluded/ back to source directories.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Quality filter AI conversations for UltraRAG")
     parser.add_argument("--dry-run", action="store_true", help="Preview without moving files")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show per-file scoring")
     parser.add_argument("--threshold", type=int, default=MIN_SCORE_KEEP, help=f"Min score to keep (default: {MIN_SCORE_KEEP})")
+    parser.add_argument("--restore", action="store_true", help="Move all files from _excluded/ back to their source dirs")
     args = parser.parse_args()
-    run_filter(dry_run=args.dry_run, verbose=args.verbose, threshold=args.threshold)
+
+    if args.restore:
+        restore_excluded()
+    else:
+        run_filter(dry_run=args.dry_run, verbose=args.verbose, threshold=args.threshold)
