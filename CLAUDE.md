@@ -73,6 +73,13 @@ python3 scripts/profile_generator.py                          # From default ext
 python3 scripts/profile_generator.py --input output/profile/data/extractions.json
 python3 scripts/profile_generator.py --output-dir output/profile
 
+# Profile synthesizer: LLM-narrated PROFILE.md + PATTERNS.md from extractions.json (2 LLM calls)
+uv run scripts/profile_synthesizer.py --dry-run               # Preview digest + prompt sizes, no API call
+uv run scripts/profile_synthesizer.py                         # Both files, default local proxy
+uv run scripts/profile_synthesizer.py --profile-only          # Only PROFILE.md
+uv run scripts/profile_synthesizer.py --patterns-only         # Only PATTERNS.md
+uv run scripts/profile_synthesizer.py --base-url http://127.0.0.1:8317/v1 --model claude-opus-4-6-thinking
+
 # =============================================================================
 # VAULT BUILDING
 # =============================================================================
@@ -225,10 +232,15 @@ python3 scripts/migrate_to_yaml.py
 - v2 adds multi-model support: `--provider claude|gemini|codex`
 - Exports structured JSON to `output/profile/data/extractions.json`
 
-**`profile_generator.py`** - Profile aggregation:
+**`profile_generator.py`** - Profile aggregation (deterministic, no LLM):
 - Reads `output/profile/data/extractions.json` from biography extractor
-- Aggregates facts by life domain category and generates organized markdown files
-- Outputs to `output/profile/` directory
+- Aggregates facts by life domain category and generates organized markdown files (tables/counts)
+- Outputs the category subdirectory structure (`work/`, `health/`, ...) + `INDEX.md`/`TIMELINE.md`/`data/statistics.md` to `output/profile/`
+
+**`profile_synthesizer.py`** - Narrative profile synthesis (LLM sibling of `profile_generator.py`):
+- Aggregates the same `extractions.json` into a compact digest (top items per field with mention-counts, date ranges, sources, plus a monthly topic timeline), then makes **2 LLM calls** to write prose `output/profile/PROFILE.md` (biographical profile) and `PATTERNS.md` (cross-reference behavioral patterns)
+- Same OpenAI-compatible backend as `biography_extractor_v2.py` (`BIO_BASE_URL`/`BIO_API_KEY`/`BIO_MODEL` env or `--base-url`/`--api-key`/`--model`); requires `uv run` (inline `rich`+`httpx` deps)
+- Script writes the deterministic provenance header (date, model, source counts, date range); the LLM produces only the body. Files are written only on success, so a failed call never overwrites existing output. Flags: `--profile-only`, `--patterns-only`, `--dry-run`, `--max-items`
 
 **`build_vault.py`** - Flexible Obsidian vault builder:
 - Successor to `build_december_vault.py`; accepts `--all`, `--month YYYY-MM`, `--from`/`--to` date range
@@ -390,12 +402,12 @@ imports/
 - **Gemini dedup is activity-level**: Gemini has no per-conversation ID, so the extractor synthesizes one from a session-boundary timestamp. Session grouping (30-min gaps) can shift between exports, so `process_gemini_export()` now also records every activity's stable timestamp id and skips a session if its boundary id was seen **or all its activities were already imported**. Expect occasional single `_N` duplicate files on a boundary shift; the activity-level guard suppresses them on subsequent runs.
 - **Quality filter is reversible**: Excluded files are moved to `output/_excluded/`, not deleted. Move them back to restore.
 - **Biography extractors require `uv run`**: Both `biography_extractor.py` and `biography_extractor_v2.py` use inline script dependencies (`rich`) and must be run with `uv run`, not `python3`.
-- **Profile generation is two-step**: Run `biography_extractor*.py` first to produce `extractions.json`, then `profile_generator.py` to build the markdown profile.
+- **Profile generation is two-step**: Run `biography_extractor*.py` first to produce `extractions.json`, then `profile_generator.py` (deterministic tables) and/or `profile_synthesizer.py` (LLM prose `PROFILE.md`/`PATTERNS.md`) to build the profile. The two are complementary: the generator owns the category subdirs + `INDEX.md`/`TIMELINE.md`; the synthesizer owns the top-level narrative `PROFILE.md`/`PATTERNS.md` (backed up as `*.YYYY-MM-DD.md` before regeneration).
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **ai-conversation-toolkit** (1720 symbols, 3704 relationships, 147 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **ai-conversation-toolkit** (1739 symbols, 3737 relationships, 149 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
