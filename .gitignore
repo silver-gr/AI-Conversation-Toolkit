@@ -52,3 +52,6 @@ accounts.json
 .serena/
 output-backup/
 slopo.conf.yaml
+
+# agentmemory MCP runtime state store (written to repo root)
+data/
