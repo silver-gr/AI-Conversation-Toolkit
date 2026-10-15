@@ -375,7 +375,9 @@ def load_chatgpt_library(export_dir: Path) -> dict[str, list[dict]]:
             item = {
                 'kind': 'file',
                 'digest': hashlib.sha256(raw).hexdigest(),
+                'file_id': entry['file_id'],
                 'title': title,
+                'body': body,
                 'message': {
                     'id': None,
                     'role': 'assistant',
@@ -401,9 +403,10 @@ def inject_library_items(messages: list[dict], mapping: dict, items: list[dict],
                          seen_digests: set | None = None) -> list[dict]:
     """Insert library items after their origination message, else by timestamp.
 
-    Text files are only injected when their origination message is an assistant
-    message in this thread, deduplicated by body digest via `seen_digests`;
-    reports are always injected.
+    Text files the user attached (their file_id is in a user message's attachments)
+    become a user attachment after that message; other text files are only injected
+    when their origination message is an assistant message in this thread. Files are
+    deduplicated by body digest via `seen_digests`; reports are always injected.
     """
     if not items:
         return messages
@@ -414,14 +417,26 @@ def inject_library_items(messages: list[dict], mapping: dict, items: list[dict],
         for node_id, node in mapping.items()
         if node.get('message') and node['message'].get('author', {}).get('role') == 'assistant'
     }
+    uploads = {}
+    for node_id, node in mapping.items():
+        msg = node.get('message') or {}
+        if (msg.get('author') or {}).get('role') == 'user':
+            for att in (msg.get('metadata') or {}).get('attachments') or []:
+                uploads[att.get('id')] = msg.get('id') or node_id
     emitted = {m.get('id') for m in messages if m.get('id')}
     after: dict[str, list[dict]] = defaultdict(list)
     loose = []
     for item in items:
         if item['kind'] == 'file':
-            if item['origin'] not in assistant_ids or item['digest'] in seen_digests:
+            uploader = uploads.get(item['file_id'])
+            if (uploader not in emitted if uploader else item['origin'] not in assistant_ids) \
+                    or item['digest'] in seen_digests:
                 continue
             seen_digests.add(item['digest'])
+            if uploader:
+                after[uploader].append(dict(item['message'], role='user', content=(
+                    f"**Attachment: {item['title']}**\n\n" + _fenced(item['body'], char='~'))))
+                continue
         if item['origin'] in emitted:
             after[item['origin']].append(item['message'])
         else:
@@ -525,8 +540,8 @@ def _escape_yaml_string(s: str) -> str:
     """Escape a string for safe YAML output (double-quoted scalar)."""
     if not s:
         return '""'
-    # Escape backslashes first, then double quotes
-    s = s.replace('\\', '\\\\').replace('"', '\\"')
+    # Escape backslashes first, then double quotes; a raw newline would break the scalar
+    s = s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ')
     return f'"{s}"'
 
 
@@ -554,7 +569,7 @@ def conversation_to_markdown(conv: dict, include_full_content: bool = True,
     """Convert a conversation to markdown with FULL content."""
     lines = []
 
-    title = conv['title']
+    title = ' '.join(conv['title'].split('\n')).strip() or 'Untitled'
     created = conv['created_at']
     messages = conv['messages']
 
@@ -602,6 +617,10 @@ def conversation_to_markdown(conv: dict, include_full_content: bool = True,
     # Header
     lines.append(f"# {title}")
     lines.append("")
+
+    summary = (conv.get('summary') or '').strip()
+    if summary:
+        lines += ["## Summary", "", summary, ""]
 
     # Full Conversation
     lines.append("## Conversation")

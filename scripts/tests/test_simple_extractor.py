@@ -124,6 +124,14 @@ def test_chatgpt_library_injection():
         path = _write_chatgpt_export(Path(tmp), [_chatgpt_conv('t1', late, 'u2')], library, dats)
         late_contents = [m['content'] for m in list(parse_chatgpt_export(path))[0]['messages']]
     assert late_contents[3].startswith('#### Deep Research report') and late_contents[4] == 'thanks'
+    up_map = dict(mapping, u2=dict(mapping['u2'], message=dict(mapping['u2']['message'],
+                  metadata={'attachments': [{'id': 'f_up', 'name': 'log.txt'}]})))
+    up_lib = [_lib('f_up', 't1', 'a1', 'text/plain', 'log.txt')]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_chatgpt_export(Path(tmp), [_chatgpt_conv('t1', up_map, 'u2')], up_lib, {'f_up.dat': 'rsync out'})
+        up = list(parse_chatgpt_export(path))[0]['messages']
+    assert [(m['role'], m['content']) for m in up[-2:]] == [
+        ('user', 'thanks'), ('user', '**Attachment: log.txt**\n\n~~~\nrsync out\n~~~')]  # upload, not assistant file
     assert orphan['id'] == 'gone' and orphan['title'] == 'Report T'
     assert orphan['research_type'] == 'chatgpt_deep_research' and len(orphan['messages']) == 1
 
@@ -188,6 +196,9 @@ def test_claude_branch_blocks_attachments():
     md = conversation_to_markdown(c)
     assert 'source: claude\nid: "cl1"\nmodel: null\n' in md
     assert 'research_type: claude_research\ntools:\n  - SendUserMessage\n' in md
+    assert '## Summary' not in md
+    summed = conversation_to_markdown(dict(c, summary='**Overview** what happened'))
+    assert '# T\n\n## Summary\n\n**Overview** what happened\n\n## Conversation' in summed
 
 
 def test_claude_research_type_web_search_and_legacy_order():

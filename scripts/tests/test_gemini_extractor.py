@@ -21,7 +21,7 @@ def test_escaped_code_survives():
     )
     assert out == (
         '### HTML\n\n```\n<div class="x">\n\n\n\n  <h2>Αδυναμία</h2>\n</div>\n```\n\n'
-        'Use `a < b` and x <y> text.'
+        'Use `a < b` and x \\<y> text.'
     ), out
 
 
@@ -97,6 +97,12 @@ def test_pre_in_list_item_and_attachment_only_prompt():
     act = parse_activity(_entry(title='Prompted ', attachedFiles=['brief.pdf'], safeHtmlItem=None))
     md = activity_to_markdown(group_into_conversations([act])[0])
     assert '### USER' in md and '*Attachments: brief.pdf*' in md
+
+
+def test_text_newlines_kept_for_pipe_tables():
+    assert strip_html('<p>| A | B |\n| :--- | :--- |\n| 1 | 2 |</p>') == '| A | B |\n| :--- | :--- |\n| 1 | 2 |'
+    assert strip_html('<ul>\n<li>one</li>\n<li>two</li>\n</ul>') == '- one\n- two'
+
 
 if __name__ == '__main__':
     for name, fn in list(globals().items()):

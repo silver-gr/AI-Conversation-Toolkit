@@ -47,6 +47,17 @@ python3 scripts/memories_to_md.py
 # Migrate old inline metadata to YAML frontmatter (idempotent)
 python3 scripts/migrate_to_yaml.py
 
+# Rebuild output/{chatgpt-full,claude-full,gemini}/INDEX.md from frontmatter
+python3 scripts/rebuild_indexes.py               # --dry-run prints counts only
+
+# Re-render already-imported conversations in place after an extractor fix
+python3 scripts/backfill_rerender.py             # Dry-run: per-source action counts
+python3 scripts/backfill_rerender.py --plan /tmp/plan.json   # Also write the plan
+python3 scripts/backfill_rerender.py --apply     # Overwrite files (back up output/ first)
+
+# Runnable checks (plain asserts, no pytest needed)
+for t in scripts/tests/test_*.py; do python3 "$t"; done
+
 # Identify and rename Gemini files with non-descriptive titles
 python3 scripts/gemini_meta_indexer.py              # Dry-run: preview changes
 python3 scripts/gemini_meta_indexer.py --rename      # Apply renames
@@ -100,7 +111,7 @@ python3 scripts/simple_extractor.py ChatGPT/conversations.json -o output/chatgpt
 python3 scripts/simple_extractor.py Claude/conversations.json -o output/claude-full
 
 # Extract Gemini activity (groups into sessions by 30-min gaps)
-python3 scripts/gemini_extractor.py "Google/Η δραστηριότητά μου/Εφαρμογές Gemini/MyActivity.json" -o output/gemini
+python3 scripts/gemini_extractor.py "Google/My Activity/Gemini Apps/MyActivity.json" -o output/gemini
 python3 scripts/gemini_extractor.py path/to/MyActivity.json -o output/gemini --no-grouping
 
 # AI-powered analysis with caching (requires Claude CLI)
@@ -122,27 +133,38 @@ python3 scripts/import_logger.py regenerate                      # Rebuild markd
 ```
 
 ## Standard Import Workflow
+
+Use an interpreter that has `ijson`, `pyyaml` and `rich` (here `/Users/silver/venv/bin/python3`). Homebrew `python3` moved to 3.15 in Oct 2026 without them, and `run_import.py` then crashes at startup.
+
 ```bash
-# 1. Place fresh exports in their directories:
-#    Per-account directories as defined in accounts.json
-#    (e.g., ChatGPT/conversations.json, Claude-Pro/conversations.json, etc.)
+# 1. Place fresh exports:
+#    ChatGPT/  - unzip the export zip there; binary attachments (file_*.dat, file-*) can stay
+#                in the zip: library_files.json + the zip are read in memory for Deep Research
+#                reports and generated files. Split conversations-NNN.json are auto-merged.
+#    Claude/   - unzip every *-000.zip from the manifest (conversations, memories, feedback ->
+#                reflections/, design_chats, frames -> artifacts/, light_metadata, projects).
+#                Manifest links are single-use and expire in 24h; download in the browser.
+#    Google/My Activity/Gemini Apps/MyActivity.json (English locale; rename the previous
+#                export's folder first so only the new one matches).
 
-# 2. Run incremental import (skips previously imported conversations)
-#    Multi-account (recommended):
-python3 scripts/run_import.py --config accounts.json --incremental
-#    Single-account (legacy):
-python3 scripts/run_import.py --all --incremental
+# 2. Check the formats before importing. Dedup is by conversation id: content an
+#    extractor drops at import is never revisited. Dry-run extraction into a scratch dir
+#    (process_export / process_gemini_export with incremental=True and the logged ids)
+#    and inspect the files before touching output/.
 
-# 3. Run post-processing
-python3 scripts/research_index.py
+# 3. Back up output/ and imports/import_log.json, then run the incremental import
+python3 scripts/run_import.py --all --incremental      # or --config accounts.json
+
+# 4. Post-processing
+python3 scripts/quality_filter.py --dry-run && python3 scripts/quality_filter.py
 python3 scripts/memories_to_md.py
-
-# 4. Rename non-descriptive Gemini titles
+python3 scripts/research_index.py
 python3 scripts/gemini_meta_indexer.py --rename
-
-# 5. Migrate any old-format files to YAML frontmatter (idempotent, safe to re-run)
 python3 scripts/migrate_to_yaml.py
+python3 scripts/rebuild_indexes.py
 ```
+
+After an extractor fix, run `backfill_rerender.py` (dry-run first) so already-imported conversations get the fix too.
 
 ## Architecture
 
@@ -265,6 +287,7 @@ type: conversation
 title: "Conversation Title"
 date: 2025-07-02T14:30:00
 source: chatgpt    # chatgpt | claude | gemini
+id: "6a7c0bb3-..." # conversation id (Gemini: session id); files without it are legacy renders
 account: personal  # optional, from accounts.json (omitted if unnamed)
 model: null
 messages: 28
@@ -273,9 +296,13 @@ has_code: true
 topics:
   - keyword1
   - keyword2
-research_type: null
+research_type: null  # chatgpt_deep_research | claude_research | claude_web_search (3+ web_search calls)
+tools:             # Claude only, sorted unique tool_use names; omitted when none
+  - web_search
 ---
 # Conversation Title
+
+## Summary          # Claude only, when the export has a conversation summary
 
 ## Conversation
 
@@ -349,8 +376,11 @@ imports/
 | 2026-02-09 | 48 | 319 | 8 | Latest import |
 | 2026-03-02 | 28 | 30 | — | Split-file export format (merged before import) |
 | 2026-07-07 | 138 | 150 | 95 | Auto-merge built in; fixed `children`-less mapping (silent 0-import); Gemini activity-level dedup |
+| 2026-09-03 | 0 | 39 | 61 | Gemini "Prompted" title prefix fixed (real queries were skipped); `--skip-imported` drops 1,251 bulk-imported prompts |
+| 2026-09-14 | 128 | 0 | 0 | ChatGPT-only export |
+| 2026-10-15 | 96 | 20 | 40 | Extractor content-loss fixes (multimodal/voice, current branch, DR reports, Claude blocks/attachments/summary, Gemini all responses + HTML converter); backfill re-rendered 3,143 existing files |
 
-**Totals**: 1,771 ChatGPT + 692 Claude + 835 Gemini sessions
+**Totals (2026-10-15, files kept + `_excluded/`)**: ChatGPT 1,358 + 592, Claude 559 + 139, Gemini 318 + 267
 
 ## Import Log Schema
 
@@ -400,7 +430,12 @@ imports/
 - **ChatGPT split exports (auto-merged)**: As of March 2026, ChatGPT exports conversations as multiple `conversations-000.json` ... `conversations-NNN.json` files (100 per file) instead of a single `conversations.json`. **`run_import.py` now merges these automatically** (`merge_chatgpt_splits()`): when split files are present it (re)builds `ChatGPT/conversations.json` before extraction, rewriting only when a split is newer than the merged file. Manual merge (if needed): `python3 -c "import json,glob; data=[c for f in sorted(glob.glob('ChatGPT/conversations-*.json')) for c in json.load(open(f))]; json.dump(data, open('ChatGPT/conversations.json','w'))"`.
 - **ChatGPT `children`-less mapping (2026+)**: Newer ChatGPT exports drop the per-node `children` array in the `mapping` tree and keep only `parent`. `traverse_chatgpt_tree()` reconstructs child adjacency from `parent` pointers (works for older exports too). Symptom if this regresses: extraction reports "Found N conversations" but "Processed: 0" — a **silent zero-import**, no error.
 - **Gemini dedup is activity-level**: Gemini has no per-conversation ID, so the extractor synthesizes one from a session-boundary timestamp. Session grouping (30-min gaps) can shift between exports, so `process_gemini_export()` now also records every activity's stable timestamp id and skips a session if its boundary id was seen **or all its activities were already imported**. Expect occasional single `_N` duplicate files on a boundary shift; the activity-level guard suppresses them on subsequent runs.
-- **Quality filter is reversible**: Excluded files are moved to `output/_excluded/`, not deleted. Move them back to restore.
+- **Quality filter is reversible**: Excluded files are moved to `output/_excluded/`, not deleted. Move them back to restore. `--dry-run` writes `QUALITY_FILTER_REPORT.dryrun.md` and leaves the real report alone.
+- **What the extractors keep (Oct 2026)**: ChatGPT and Claude follow the current branch only (edits/regenerations dropped). ChatGPT `thoughts` and Claude `thinking` are omitted. ChatGPT `multimodal_text` (voice transcripts, text sent with images) is kept. Claude messages are built from content blocks: artifact / `create_file` / `Write` bodies (Extended Research reports live there), pasted attachments, `*[tools: ...]*` lines. Gemini keeps every `safeHtmlItem` (extra Deep Research reports) and converts HTML with a stdlib parser.
+- **ChatGPT library content**: Deep Research reports and assistant-generated text files are not in `conversations.json`. They are `<file_id>.dat` entries in the export zip, listed in `library_files.json`, and injected into their conversation. Files the user uploaded become user attachments.
+- **ChatGPT tool messages gone from exports (2026)**: DALL-E prompt JSON and memory (bio) notes no longer appear in exports. The backfill keeps them in existing files, tagged `*[restored from an earlier export]*`.
+- **Claude memories layout**: since Sept 2026 memories ship as `Claude/memories/<account-uuid>.json` (conversations_memory, project_memories, memory_files). `memories_to_md.py` renders all of it plus `Claude/reflections/`, names projects from `memory_files`, and moves files it no longer produces to `output/_backup/memories-<timestamp>/`.
+- **Backfill safety**: `backfill_rerender.py` matches by `id`, else by date (minute precision for old renders; content-verified when conversations share a minute), keeps filenames and titles, skips Gemini files whose activities were deleted upstream, and holds back ChatGPT files that would shrink by more than half (richest content on a dropped branch).
 - **Biography extractors require `uv run`**: Both `biography_extractor.py` and `biography_extractor_v2.py` use inline script dependencies (`rich`) and must be run with `uv run`, not `python3`.
 - **Profile generation is two-step**: Run `biography_extractor*.py` first to produce `extractions.json`, then `profile_generator.py` (deterministic tables) and/or `profile_synthesizer.py` (LLM prose `PROFILE.md`/`PATTERNS.md`) to build the profile. The two are complementary: the generator owns the category subdirs + `INDEX.md`/`TIMELINE.md`; the synthesizer owns the top-level narrative `PROFILE.md`/`PATTERNS.md` (backed up as `*.YYYY-MM-DD.md` before regeneration).
 

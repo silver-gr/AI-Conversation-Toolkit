@@ -142,7 +142,14 @@ class _HTMLToMarkdown(HTMLParser):
         if self.pre_depth or self.frames[-1]['tag'] == 'code':
             self._emit(data)
             return
-        text = re.sub(r'[ \t\r\n\f]+', ' ', data)
+        if data.strip():
+            # Gemini writes markdown pipe tables and line breaks as raw text inside <p>.
+            text = re.sub(r'[ \t\r\f]*\n[ \t\r\n\f]*', '\n', data)
+            text = re.sub(r'[ \t\r\f]+', ' ', text)
+            # Literal tags Gemini displayed (&lt;thinking&gt;) must not become live HTML.
+            text = re.sub(r'<(?=[A-Za-z/!])', r'\\<', text)
+        else:
+            text = re.sub(r'[ \t\r\n\f]+', ' ', data)
         if self._at_line_start():
             text = text.lstrip(' ')
         if text:
