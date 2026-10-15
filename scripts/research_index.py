@@ -164,11 +164,15 @@ def extract_metadata_from_md(filepath: Path, source_hint: str = '') -> dict:
 def detect_chatgpt_deep_research(content: str, fm: dict) -> str | None:
     """Detect ChatGPT Deep Research using structural markers.
 
+    Tier 0: research_type: chatgpt_deep_research in YAML frontmatter (set by extractor)
     Tier 1: model: research in YAML frontmatter
     Tier 2: PUA Unicode chars + source/reference headers in assistant text
     Tier 3: Source list pattern (em-dash + italic) in last assistant response
     Tier 4: Very long single assistant response (>30K chars) — Browse can't produce this
     """
+    if fm.get('research_type') == 'chatgpt_deep_research':
+        return 'deep_research_report'
+
     # Tier 1: model field in frontmatter
     if fm.get('model', '').lower() == 'research':
         return 'model:research'
@@ -204,12 +208,22 @@ def detect_chatgpt_deep_research(content: str, fm: dict) -> str | None:
     return None
 
 
-def detect_claude_research(content: str) -> str | None:
+def detect_claude_research(content: str, fm: dict) -> str | None:
     """Detect Claude Research tool usage.
 
+    New-format files (frontmatter has 'id'): research_type set by the extractor is authoritative.
+    Legacy files:
     Tier 1: Literal 'web_search' tool name in content
     Tier 2: 'research task' phrase — Claude describes using its research feature
     """
+    research_type = fm.get('research_type', '')
+    if research_type == 'claude_research':
+        return 'claude_research_tool'
+    if research_type == 'claude_web_search':
+        return 'web_search_tool'
+    # New renders contain '*[tools: web_search x1]*' lines, so body heuristics no longer apply
+    if 'id' in fm:
+        return None
     if len(content) < MIN_CLAUDE_SIZE:
         return None
     if 'web_search' in content:
@@ -266,7 +280,7 @@ def scan_source(source_dir: Path, source_name: str, detect_fn) -> list[dict]:
         fm = _parse_yaml_frontmatter(content)
 
         # Call the source-specific detection function
-        if source_name == 'chatgpt':
+        if source_name in ('chatgpt', 'claude'):
             detection = detect_fn(content, fm)
         else:
             detection = detect_fn(content)
@@ -404,6 +418,7 @@ def create_research_index(
     lines.append("")
     lines.append("| Method | Signal | Confidence |")
     lines.append("|--------|--------|------------|")
+    lines.append("| `deep_research_report` | `research_type: chatgpt_deep_research` in YAML frontmatter (set by extractor) | Definitive |")
     lines.append("| `model:research` | `model: research` in YAML frontmatter | Definitive |")
     lines.append("| `source_header` | PUA Unicode chars + `## References`/`### Sources Consulted` header in assistant text | High |")
     lines.append("| `source_list_pattern` | 3+ source citation lines with em-dash + italics in last assistant response | High |")
@@ -413,8 +428,9 @@ def create_research_index(
     lines.append("")
     lines.append("| Method | Signal | Confidence |")
     lines.append("|--------|--------|------------|")
-    lines.append("| `web_search_tool` | Literal string `web_search` in content (tool name) | Definitive |")
-    lines.append('| `research_task` | "research task" phrase in content (Claude Research feature marker) | High |')
+    lines.append("| `claude_research_tool` | `research_type: claude_research` in YAML frontmatter (set by extractor) | Definitive |")
+    lines.append("| `web_search_tool` | `research_type: claude_web_search` in YAML frontmatter; legacy files (no `id`): literal string `web_search` in content | Definitive |")
+    lines.append('| `research_task` | Legacy files only (no `id`): "research task" phrase in content (Claude Research feature marker) | High |')
     lines.append("")
     lines.append("### Gemini")
     lines.append("")

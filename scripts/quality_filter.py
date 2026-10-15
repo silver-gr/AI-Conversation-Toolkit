@@ -66,8 +66,14 @@ CLAUDE_RESEARCH_PATTERNS = [
     "i'll use the research",
 ]
 
-def detect_research(body_lower: str, source: str) -> bool:
+def detect_research(body_lower: str, source: str, meta: Optional[dict] = None) -> bool:
     """Returns True if conversation contains research content."""
+    if meta and meta.get("research_type"):
+        return True
+    if meta and "id" in meta:
+        # New-format renders list tool calls in the body ("*[tools: web_search x1]*"),
+        # so the bare tool name is no longer a research signal there.
+        body_lower = body_lower.replace("web_search", "")
     if source == "gemini":
         for p in GEMINI_RESEARCH_PATTERNS:
             if p in body_lower:
@@ -188,7 +194,7 @@ def score_conversation(filepath: Path, source: str) -> tuple[int, list[str], boo
         return -100, [f"msgs=1 + chars={characters} → HARD EXCLUDE (no exchange)"], False, ""
 
     # ── 2. Force keep: research conversations ──────────────────────────────
-    is_research = detect_research(body_lower, source)
+    is_research = detect_research(body_lower, source, meta)
     if is_research:
         reasons.append("RESEARCH detected → force keep")
         # Extra bonus for substantive research
@@ -367,7 +373,7 @@ def run_filter(dry_run: bool = False, verbose: bool = False, threshold: int = MI
         print(f"\n[DRY RUN] No files moved. Run without --dry-run to apply.")
 
     # ── Report ───────────────────────────────────────────────────────────────
-    report_path = OUTPUT_DIR / "QUALITY_FILTER_REPORT.md"
+    report_path = OUTPUT_DIR / ("QUALITY_FILTER_REPORT.dryrun.md" if dry_run else "QUALITY_FILTER_REPORT.md")
     write_report(report_path, excluded_list, kept_list, stats, dry_run, threshold)
     print(f"\nReport: {report_path}")
 

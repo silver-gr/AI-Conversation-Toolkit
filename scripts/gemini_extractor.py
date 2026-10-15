@@ -9,8 +9,8 @@ Each entry is a standalone query+response pair.
 
 import json
 import re
-import html
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Generator
@@ -23,36 +23,238 @@ from parser import slugify, parse_timestamp
 from import_logger import ImportLogger
 
 
+_HEADINGS = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+_PARAGRAPH_TAGS = {'p', 'div', 'section'}
+_INLINE_WRAP = {'strong': '**', 'b': '**', 'em': '*', 'i': '*'}
+_INLINE_FRAMES = set(_INLINE_WRAP) | {'a', 'code'}
+
+
+def _one_line(text: str) -> str:
+    return re.sub(r'[ \t]*\n[ \t\n]*', ' ', text).strip(' ')
+
+
+class _HTMLToMarkdown(HTMLParser):
+    """Stack-based HTML -> Markdown converter for Gemini safeHtmlItem html.
+
+    Elements whose output depends on their whole content (li, blockquote,
+    headings, cells, links, emphasis, code) collect text in a frame and render
+    it on close. <pre> bodies are stashed as placeholders so later whitespace
+    cleanup never touches them; the placeholder's line prefix (list indent or
+    '> ') is applied to every code line on restore.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.frames = [{'tag': 'root', 'buf': []}]
+        self.lists = []
+        self.tables = []
+        self.pre_blocks = []
+        self.pre_depth = 0
+
+    def _emit(self, s: str):
+        self.frames[-1]['buf'].append(s)
+
+    def _at_line_start(self) -> bool:
+        for frame in reversed(self.frames):
+            for s in reversed(frame['buf']):
+                if s:
+                    return s.endswith('\n')
+            if frame['tag'] not in _INLINE_FRAMES:
+                return True
+        return True
+
+    def _block_break(self):
+        self._emit('\n\n')
+
+    def _newline(self):
+        if not self._at_line_start():
+            self._emit('\n')
+
+    def _push(self, tag: str, **extra):
+        self.frames.append({'tag': tag, 'buf': [], **extra})
+
+    def handle_starttag(self, tag, attrs):
+        if self.pre_depth:
+            if tag == 'pre':
+                self.pre_depth += 1
+            elif tag == 'br':
+                self._emit('\n')
+            return
+        if tag in _PARAGRAPH_TAGS:
+            self._block_break()
+        elif tag == 'br':
+            self._emit('\n')
+        elif tag == 'hr':
+            self._block_break()
+            self._emit('---')
+            self._block_break()
+        elif tag == 'img':
+            self._emit('[image]')
+        elif tag == 'a':
+            self._push(tag, href=dict(attrs).get('href') or '')
+        elif tag == 'pre':
+            self.pre_depth = 1
+            self._push(tag)
+        elif tag in ('ul', 'ol'):
+            if self.lists:
+                self._newline()
+            else:
+                self._block_break()
+            self.lists.append({'ordered': tag == 'ol', 'n': 0})
+        elif tag == 'li':
+            lst = self.lists[-1] if self.lists else {'ordered': False, 'n': 0}
+            lst['n'] += 1
+            self._push(tag, marker=f"{lst['n']}. " if lst['ordered'] else '- ')
+        elif tag == 'table':
+            self.tables.append({'rows': [], 'caption': ''})
+            self._push(tag)
+        elif tag == 'tr':
+            if self.tables:
+                self.tables[-1]['rows'].append([])
+        elif (tag in _HEADINGS or tag in _INLINE_FRAMES
+              or tag in ('blockquote', 'td', 'th', 'caption')):
+            self._push(tag)
+
+    def handle_endtag(self, tag):
+        if self.pre_depth:
+            if tag != 'pre':
+                return
+            self.pre_depth -= 1
+            if self.pre_depth:
+                return
+        if tag in _PARAGRAPH_TAGS:
+            self._block_break()
+        elif tag in ('ul', 'ol'):
+            if self.lists:
+                self.lists.pop()
+            if self.lists:
+                self._newline()
+            else:
+                self._block_break()
+        elif any(f['tag'] == tag for f in self.frames[1:]):
+            while True:
+                frame = self.frames.pop()
+                self._close(frame)
+                if frame['tag'] == tag:
+                    break
+
+    def handle_data(self, data):
+        if self.pre_depth or self.frames[-1]['tag'] == 'code':
+            self._emit(data)
+            return
+        text = re.sub(r'[ \t\r\n\f]+', ' ', data)
+        if self._at_line_start():
+            text = text.lstrip(' ')
+        if text:
+            self._emit(text)
+
+    def _close(self, frame: dict):
+        tag = frame['tag']
+        text = ''.join(frame['buf'])
+
+        if tag == 'pre':
+            if text.startswith('\n'):
+                text = text[1:]
+            text = text.rstrip('\n')
+            fence = '```'
+            while fence in text:
+                fence += '`'
+            self.pre_blocks.append(f'{fence}\n{text}\n{fence}')
+            self._block_break()
+            self._emit(f'\x00PRE{len(self.pre_blocks) - 1}\x00')
+            self._block_break()
+        elif tag in _HEADINGS:
+            text = _one_line(text)
+            if text:
+                self._block_break()
+                self._emit('#' * int(tag[1]) + ' ' + text)
+                self._block_break()
+        elif tag == 'code':
+            text = text.replace('\n', ' ')
+            if text.strip():
+                ticks = '`'
+                while ticks in text:
+                    ticks += '`'
+                pad = ' ' if text.startswith('`') or text.endswith('`') else ''
+                self._emit(f'{ticks}{pad}{text}{pad}{ticks}')
+        elif tag in _INLINE_FRAMES:
+            inner = text.strip(' ')
+            lead = ' ' if text.startswith(' ') else ''
+            trail = ' ' if text.endswith(' ') and inner else ''
+            if tag == 'a':
+                href = frame['href']
+                if href:
+                    inner = f'[{inner or href}]({href})'
+            elif inner:
+                mark = _INLINE_WRAP[tag]
+                inner = f'{mark}{inner}{mark}'
+            self._emit(lead + inner + trail)
+        elif tag == 'li':
+            text = re.sub(r'\n{3,}', '\n\n', text).strip(' \n')
+            marker = frame['marker']
+            indent = ' ' * len(marker)
+            lines = text.split('\n')
+            body = [marker + lines[0]] + [indent + l if l else '' for l in lines[1:]]
+            self._newline()
+            self._emit('\n'.join(body) + '\n')
+        elif tag == 'blockquote':
+            text = re.sub(r'\n{3,}', '\n\n', text).strip(' \n')
+            if text:
+                self._block_break()
+                self._emit('\n'.join('> ' + l if l else '>' for l in text.split('\n')))
+                self._block_break()
+        elif tag in ('td', 'th'):
+            cell = _one_line(text).replace('|', '\\|')
+            if self.tables and self.tables[-1]['rows']:
+                self.tables[-1]['rows'][-1].append(cell)
+            else:
+                self._emit(cell + ' ')
+        elif tag == 'caption':
+            if self.tables:
+                self.tables[-1]['caption'] = _one_line(text)
+            else:
+                self._emit(_one_line(text))
+        elif tag == 'table':
+            table = self.tables.pop()
+            rows = [r for r in table['rows'] if r]
+            self._block_break()
+            if table['caption']:
+                self._emit(table['caption'])
+                self._block_break()
+            if rows:
+                width = max(len(r) for r in rows)
+                lines = ['| ' + ' | '.join(r + [''] * (width - len(r))) + ' |' for r in rows]
+                lines.insert(1, '|' + ' --- |' * width)
+                self._emit('\n'.join(lines))
+                self._block_break()
+
+
 def strip_html(html_content: str) -> str:
-    """Convert HTML to plain text/markdown."""
+    """Convert HTML to markdown."""
     if not html_content:
         return ''
 
-    # Decode HTML entities
-    text = html.unescape(html_content)
+    converter = _HTMLToMarkdown()
+    converter.feed(html_content)
+    converter.close()
+    while len(converter.frames) > 1:
+        converter._close(converter.frames.pop())
 
-    # Convert common HTML to markdown
-    text = re.sub(r'<h1[^>]*>(.*?)</h1>', r'# \1\n', text, flags=re.DOTALL)
-    text = re.sub(r'<h2[^>]*>(.*?)</h2>', r'## \1\n', text, flags=re.DOTALL)
-    text = re.sub(r'<h3[^>]*>(.*?)</h3>', r'### \1\n', text, flags=re.DOTALL)
-    text = re.sub(r'<h4[^>]*>(.*?)</h4>', r'#### \1\n', text, flags=re.DOTALL)
-    text = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n\n', text, flags=re.DOTALL)
-    text = re.sub(r'<br\s*/?>', '\n', text)
-    text = re.sub(r'<li[^>]*>(.*?)</li>', r'- \1\n', text, flags=re.DOTALL)
-    text = re.sub(r'<strong>(.*?)</strong>', r'**\1**', text, flags=re.DOTALL)
-    text = re.sub(r'<b>(.*?)</b>', r'**\1**', text, flags=re.DOTALL)
-    text = re.sub(r'<em>(.*?)</em>', r'*\1*', text, flags=re.DOTALL)
-    text = re.sub(r'<i>(.*?)</i>', r'*\1*', text, flags=re.DOTALL)
-    text = re.sub(r'<code>(.*?)</code>', r'`\1`', text, flags=re.DOTALL)
-    text = re.sub(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', r'[\2](\1)', text, flags=re.DOTALL)
-
-    # Remove remaining tags
-    text = re.sub(r'<[^>]+>', '', text)
-
-    # Clean up whitespace
+    text = ''.join(converter.frames[0]['buf'])
+    text = '\n'.join(line.rstrip(' \t') for line in text.split('\n'))
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = text.strip()
 
+    def restore_pre(m):
+        prefix, marker = m.group(1), m.group(2) or ''
+        lines = converter.pre_blocks[int(m.group(3))].split('\n')
+        # A fence opening a list item keeps the item's continuation indent on later lines.
+        cont = prefix + ' ' * len(marker)
+        return '\n'.join([prefix + marker + lines[0]]
+                         + [cont + l if l else cont.rstrip() for l in lines[1:]])
+
+    text = re.sub(r'^([ >]*)((?:[-*+]|\d+\.) )?\x00PRE(\d+)\x00$', restore_pre, text, flags=re.M)
+    text = re.sub(r'\x00PRE(\d+)\x00', lambda m: converter.pre_blocks[int(m.group(1))], text)
     return text
 
 
@@ -101,6 +303,7 @@ def parse_activity(entry: dict) -> dict | None:
     response = ''
     canvas_content = ''
     attachments = []
+    generated_images = 0
 
     # Check for query submission
     if ('Υποβλήθηκε το ερώτημα' in title
@@ -112,17 +315,27 @@ def parse_activity(entry: dict) -> dict | None:
             activity_type = 'imported_query'
         user_query = extract_query_from_title(title)
 
-        # Extract response from safeHtmlItem
-        html_items = entry.get('safeHtmlItem', [])
-        if html_items:
-            response = strip_html(html_items[0].get('html', ''))
+        # Extract response from every safeHtmlItem (Deep Research reports
+        # and plans arrive as separate items)
+        parts = []
+        for item in entry.get('safeHtmlItem') or []:
+            text = strip_html(item.get('html', ''))
+            if text and text not in parts:
+                parts.append(text)
+        response = '\n\n---\n\n'.join(parts)
 
         # Check for attachments info in subtitles
         subtitles = entry.get('subtitles', [])
         for sub in subtitles:
             name = sub.get('name', '')
-            if 'συνημμένα αρχεία' in name or 'attached files' in name.lower():
+            if ('συνημμένα αρχεία' in name or 'attached files' in name.lower()
+                    or re.match(r'attached \d+ files?\.', name, re.IGNORECASE)):
                 attachments.append(name)
+            m = re.match(
+                r'(\d+) (?:generated images?|δημιουργημένη εικόνα|δημιουργημένες εικόνες)\.',
+                name, re.IGNORECASE)
+            if m:
+                generated_images += int(m.group(1))
 
     # Check for Canvas creation
     elif 'Δημιουργήθηκε Gemini Canvas' in title or 'Created Gemini Canvas' in title:
@@ -145,7 +358,8 @@ def parse_activity(entry: dict) -> dict | None:
         'canvas_content': canvas_content,
         'attachments': attachments,
         'has_image': bool(entry.get('imageFile')),
-        'attached_files': entry.get('attachedFiles', [])
+        'attached_files': entry.get('attachedFiles') or [],
+        'generated_images': generated_images,
     }
 
 
@@ -279,6 +493,7 @@ def activity_to_markdown(conv: dict, account: str | None = None) -> str:
     else:
         lines.append("date: null")
     lines.append("source: gemini")
+    lines.append(f"id: {_escape_yaml_string(conv['id'])}")
     if account:
         lines.append(f"account: {account}")
     lines.append("model: null")
@@ -305,15 +520,23 @@ def activity_to_markdown(conv: dict, account: str | None = None) -> str:
 
     for i, activity in enumerate(activities, 1):
         # User query
-        if activity['query']:
+        files = [
+            f for f in activity.get('attached_files') or []
+            if not f.startswith('watermarked_img_')
+        ]
+        if activity['query'] or files or activity['attachments'] or activity['has_image']:
             timestamp = activity['timestamp']
             time_str = f" ({timestamp.strftime('%H:%M')})" if timestamp else ""
             lines.append(f"### USER{time_str}")
             lines.append("")
-            lines.append(activity['query'])
-            lines.append("")
+            if activity['query']:
+                lines.append(activity['query'])
+                lines.append("")
 
-            if activity['attachments']:
+            if files:
+                lines.append(f"*Attachments: {', '.join(files)}*")
+                lines.append("")
+            elif activity['attachments']:
                 lines.append(f"*Attachments: {', '.join(activity['attachments'])}*")
                 lines.append("")
 
@@ -329,10 +552,16 @@ def activity_to_markdown(conv: dict, account: str | None = None) -> str:
             lines.append("### GEMINI (Canvas)")
             lines.append("")
             lines.append(activity['canvas_content'])
-        elif activity['response']:
+        elif activity['response'] or activity.get('generated_images'):
             lines.append("### GEMINI")
             lines.append("")
-            lines.append(activity['response'])
+            if activity['response']:
+                lines.append(activity['response'])
+            n_images = activity.get('generated_images', 0)
+            if n_images:
+                if activity['response']:
+                    lines.append("")
+                lines.append(f"*[{n_images} generated image{'s' if n_images != 1 else ''}]*")
 
         lines.append("")
         lines.append("---")

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Phase 0: Convert Claude memories.json to organized markdown files.
-Quick win - immediate readable output from pre-extracted context.
+Phase 0: Convert Claude memories exports to organized markdown files.
+Reads Claude/memories/*.json (or legacy Claude/memories.json) and Claude/reflections/*.json.
 """
 
 import json
 import os
 import re
+import shutil
+import unicodedata
 from pathlib import Path
 from datetime import datetime
 
@@ -61,16 +63,65 @@ def extract_project_name(memory_content: str) -> str:
     return 'misc'
 
 
-def memory_to_markdown(memory_id: str, memory_content: str) -> str:
+def find_memory_inputs(claude_dir: Path) -> list:
+    """Return memories export files: memories/*.json, else legacy memories.json."""
+    inputs = sorted(claude_dir.glob('memories/*.json'))
+    if inputs:
+        return inputs
+    legacy = claude_dir / 'memories.json'
+    return [legacy] if legacy.exists() else []
+
+
+def resolve_project_names(uuids, memory_files: list, claude_dir: Path) -> dict:
+    """Map project uuid -> real project name from memory_files index.md, then Takeout projects/*.json."""
+    names = {}
+    for entry in memory_files:
+        parts = (entry.get('path') or '').strip('/').split('/')
+        if len(parts) == 3 and parts[0] == 'projects' and parts[2] == 'index.md':
+            m = re.search(r'^name:\s*"?(.*?)"?\s*$', entry.get('content') or '', re.M)
+            if m and m.group(1):
+                names[parts[1]] = m.group(1)
+
+    for uuid in uuids:
+        if uuid in names:
+            continue
+        candidates = [claude_dir / 'projects' / f'{uuid}.json']
+        candidates += sorted(claude_dir.glob(f'Takeout*/projects/{uuid}.json'))
+        for candidate in candidates:
+            try:
+                name = json.loads(candidate.read_text(encoding='utf-8')).get('name')
+            except (OSError, ValueError, AttributeError):
+                continue
+            if name:
+                names[uuid] = name
+                break
+    return names
+
+
+def claim_path(rel: str, used: set, suffix: str) -> str:
+    """Reserve a relative output path, adding a deterministic suffix on in-run collision."""
+    if rel in used:
+        stem, dot, ext = rel.rpartition('.')
+        if not dot:
+            stem, ext = rel, ''
+        candidate, n = f"{stem}-{suffix}", 2
+        while candidate + dot + ext in used:
+            candidate, n = f"{stem}-{suffix}-{n}", n + 1
+        rel = candidate + dot + ext
+    used.add(rel)
+    return rel
+
+
+def memory_to_markdown(memory_id: str, memory_content: str, title: str = None) -> str:
     """Convert a single memory entry to markdown format."""
     lines = []
 
     # Add header
-    project_name = extract_project_name(memory_content)
-    lines.append(f"# {project_name.replace('-', ' ').title()}")
+    if title is None:
+        title = extract_project_name(memory_content).replace('-', ' ').title()
+    lines.append(f"# {title}")
     lines.append("")
     lines.append(f"> Memory ID: `{memory_id}`")
-    lines.append(f"> Extracted: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -87,8 +138,15 @@ def memory_to_markdown(memory_id: str, memory_content: str) -> str:
     return '\n'.join(lines)
 
 
-def process_memories(input_path: Path, output_dir: Path) -> dict:
-    """Process memories.json and create markdown files."""
+def process_memories(input_path: Path, output_dir: Path, claude_dir: Path = None, used: set = None) -> dict:
+    """Process one memories export (legacy list or current dict format) into markdown files.
+
+    `used` holds output paths (relative to output_dir) already written in this run.
+    """
+    if claude_dir is None:
+        claude_dir = input_path.parent if input_path.name == 'memories.json' else input_path.parent.parent
+    if used is None:
+        used = set()
 
     with open(input_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -106,41 +164,160 @@ def process_memories(input_path: Path, output_dir: Path) -> dict:
         memories_data = data
 
     # Get project memories
-    project_memories = memories_data.get('project_memories', {})
-    conversations_memory = memories_data.get('conversations_memory', '')
+    project_memories = memories_data.get('project_memories') or {}
+    conversations_memory = memories_data.get('conversations_memory') or ''
+    memory_files = memories_data.get('memory_files') or []
+    account_suffix = (memories_data.get('account_uuid') or input_path.stem)[:8]
+
+    def write(rel: str, content: str, suffix: str) -> Path:
+        rel = claim_path(rel, used, suffix)
+        output_file = output_dir / rel
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(content, encoding='utf-8')
+        stats['processed'] += 1
+        stats['files_created'].append(str(output_file))
+        return output_file
 
     # Process main conversations memory
     if conversations_memory:
         stats['total'] += 1
         md_content = memory_to_markdown('main-context', conversations_memory)
-        output_file = output_dir / 'main-context.md'
-        output_file.write_text(md_content, encoding='utf-8')
-        stats['processed'] += 1
-        stats['files_created'].append(str(output_file))
-        print(f"  Created: main-context.md")
-
-    # Process project memories
-    for memory_id, memory_content in project_memories.items():
-        stats['total'] += 1
-
-        project_name = extract_project_name(memory_content)
-
-        # Check if file already exists (multiple memories might map to same project)
-        base_name = project_name
-        counter = 1
-        output_file = output_dir / f"{base_name}.md"
-
-        while output_file.exists():
-            output_file = output_dir / f"{base_name}-{counter}.md"
-            counter += 1
-
-        md_content = memory_to_markdown(memory_id, memory_content)
-        output_file.write_text(md_content, encoding='utf-8')
-
-        stats['processed'] += 1
-        stats['files_created'].append(str(output_file))
+        output_file = write('main-context.md', md_content, account_suffix)
         print(f"  Created: {output_file.name}")
 
+    # Process project memories
+    names = resolve_project_names(project_memories, memory_files, claude_dir)
+    for memory_id in sorted(project_memories):
+        memory_content = project_memories[memory_id] or ''
+        stats['total'] += 1
+
+        if memory_id in names:
+            base_name = slugify(names[memory_id].replace('/', ' ')) or 'project'
+            title = names[memory_id]
+        else:
+            base_name = extract_project_name(memory_content)
+            title = None
+
+        md_content = memory_to_markdown(memory_id, memory_content, title)
+        output_file = write(f"{base_name}.md", md_content, memory_id[:8])
+        print(f"  Created: {output_file.name}")
+
+    # memory_files already carry their own frontmatter: write verbatim
+    written = 0
+    for entry in memory_files:
+        stats['total'] += 1
+        parts = (entry.get('path') or '').strip('/').split('/')
+        if any(part in ('', '.', '..') for part in parts):
+            print(f"  Skipped unsafe memory file path: {entry.get('path')!r}")
+            continue
+        write('/'.join(['files'] + parts), entry.get('content') or '', account_suffix)
+        written += 1
+    if memory_files:
+        print(f"  Created: {written} files under files/")
+
+    return stats
+
+
+def reflection_to_markdown(reflection: dict) -> str:
+    """Render one Claude reflection card as markdown with a small frontmatter."""
+    content = reflection.get('content') or {}
+    lines = ['---', 'type: reflection', f"period: {json.dumps(reflection.get('period', ''))}"]
+    if reflection.get('created_at'):
+        lines.append(f"created: {json.dumps(reflection['created_at'])}")
+    if reflection.get('updated_at'):
+        lines.append(f"updated: {json.dumps(reflection['updated_at'])}")
+    lines += ['---', f"# {content.get('hero_title', 'Reflection')}", '']
+    if content.get('period'):
+        lines += [f"> {content['period']}", '']
+    if content.get('hero_body'):
+        lines += [content['hero_body'], '']
+
+    if content.get('stats'):
+        lines += ['## Stats', '']
+        for st in content['stats']:
+            sub = f" ({st['sublabel']})" if st.get('sublabel') else ''
+            lines.append(f"- {st.get('label', '')}: {st.get('n', '')}{sub}")
+        lines.append('')
+
+    if content.get('topics'):
+        lines += ['## Topics', '']
+        for tp in content['topics']:
+            pct = f" ({tp['percent']}%)" if tp.get('percent') is not None else ''
+            desc = f" — {tp['description']}" if tp.get('description') else ''
+            lines.append(f"- **{tp.get('title', '')}**{pct}{desc}")
+        lines.append('')
+
+    for key, heading in (('about_your_time', 'About your time'),
+                         ('expanding_your_skills', 'Expanding your skills'),
+                         ('worth_thinking_about', 'Worth thinking about')):
+        if not content.get(key):
+            continue
+        lines += [f"## {heading}", '']
+        for item in content[key]:
+            skill = f" ({item['skill']})" if item.get('skill') else ''
+            lines += [f"### {item.get('title', '')}{skill}", '', item.get('body') or '', '']
+
+    return '\n'.join(lines).rstrip('\n') + '\n'
+
+
+def process_reflections(input_path: Path, output_dir: Path, used: set) -> list:
+    """Write each reflection in a Claude/reflections/*.json export to reflections/<period>.md."""
+    with open(input_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    account_suffix = (data.get('account_uuid') or input_path.stem)[:8]
+
+    created = []
+    for reflection in data.get('reflections') or []:
+        period = str(reflection.get('period') or 'undated')
+        # '/' would let an export-supplied period escape output_dir or create subdirectories
+        rel = claim_path(f"reflections/{period.replace(':', '_').replace('/', '_')}.md", used, account_suffix)
+        output_file = output_dir / rel
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(reflection_to_markdown(reflection), encoding='utf-8')
+        created.append(str(output_file))
+    return created
+
+
+def backup_stale(output_dir: Path, used: set) -> int:
+    """Move files in output_dir not produced this run to <parent>/_backup/memories-<ts>/."""
+    # NFC on both sides: HFS+ returns decomposed names for the Greek filenames we wrote
+    produced = {unicodedata.normalize('NFC', rel) for rel in used}
+    stale = sorted(p for p in output_dir.rglob('*') if p.is_file() and
+                   unicodedata.normalize('NFC', p.relative_to(output_dir).as_posix()) not in produced)
+    if stale:
+        backup_dir = output_dir.parent / '_backup' / f"memories-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        for p in stale:
+            dest = backup_dir / p.relative_to(output_dir)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p), str(dest))
+        for d in sorted((d for d in output_dir.rglob('*') if d.is_dir()), reverse=True):
+            if not any(d.iterdir()):
+                d.rmdir()
+        print(f"  Moved {len(stale)} stale file(s) to {backup_dir}")
+    else:
+        print("  Moved 0 stale files")
+    return len(stale)
+
+
+def convert_all(inputs: list, claude_dir: Path, output_dir: Path) -> dict:
+    """Convert every memories input plus reflections, then back up files this run did not produce."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    used = set()
+    stats = {'total': 0, 'processed': 0, 'files_created': []}
+
+    for input_path in inputs:
+        s = process_memories(input_path, output_dir, claude_dir, used)
+        for key in ('total', 'processed', 'files_created'):
+            stats[key] += s[key]
+
+    for input_path in sorted(claude_dir.glob('reflections/*.json')):
+        created = process_reflections(input_path, output_dir, used)
+        print(f"  Created: {len(created)} reflections from {input_path.name}")
+        stats['total'] += len(created)
+        stats['processed'] += len(created)
+        stats['files_created'] += created
+
+    stats['backed_up'] = backup_stale(output_dir, used)
     return stats
 
 
@@ -148,25 +325,24 @@ def main():
     """Main entry point."""
     # Paths
     base_dir = Path(__file__).parent.parent
-    input_path = base_dir / 'Claude' / 'memories.json'
+    claude_dir = base_dir / 'Claude'
+    inputs = find_memory_inputs(claude_dir)
     output_dir = base_dir / 'output' / 'memories'
 
     print("=" * 60)
     print("Phase 0: Converting Claude Memories to Markdown")
     print("=" * 60)
-    print(f"\nInput:  {input_path}")
+    for input_path in inputs:
+        print(f"\nInput:  {input_path}")
     print(f"Output: {output_dir}")
     print()
 
-    if not input_path.exists():
-        print(f"ERROR: Input file not found: {input_path}")
+    if not inputs:
+        print(f"ERROR: No memories export found: {claude_dir / 'memories'}/*.json or {claude_dir / 'memories.json'}")
         return 1
 
-    # Ensure output directory exists
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     print("Processing memories...")
-    stats = process_memories(input_path, output_dir)
+    stats = convert_all(inputs, claude_dir, output_dir)
 
     print()
     print("=" * 60)
@@ -178,7 +354,7 @@ def main():
     print()
     print("Files created:")
     for f in stats['files_created']:
-        print(f"  - {Path(f).name}")
+        print(f"  - {Path(f).relative_to(output_dir)}")
 
     return 0
 

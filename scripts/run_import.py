@@ -69,16 +69,16 @@ except ImportError:
 DEFAULT_PATHS = {
     'chatgpt': Path('ChatGPT/conversations.json'),
     'claude': Path('Claude/conversations.json'),
-    'gemini': Path('Google/Η δραστηριότητά μου/Εφαρμογές Gemini/MyActivity.json'),
+    'gemini': Path('Google/My Activity/Gemini Apps/MyActivity.json'),
 }
 
-# Alternative Gemini paths to try (Greek and English variations)
+# Alternative Gemini paths to try (English and Greek variations)
 GEMINI_ALT_PATHS = [
-    # Greek filename variant
-    Path('Google/Η δραστηριότητά μου/Εφαρμογές Gemini/Ηδραστηριότητάμου.json'),
     # English paths
-    Path('Google/My Activity/Gemini Apps/MyActivity.json'),
     Path('Google/Gemini/MyActivity.json'),
+    # Greek paths
+    Path('Google/Η δραστηριότητά μου/Εφαρμογές Gemini/MyActivity.json'),
+    Path('Google/Η δραστηριότητά μου/Εφαρμογές Gemini/Ηδραστηριότητάμου.json'),
 ]
 
 # Default output directory
@@ -427,17 +427,17 @@ def run_memories_extraction(base_dir: Path, output_dir: Path) -> bool:
     print_info("Extracting Claude memories...")
 
     try:
-        from memories_to_md import process_memories
+        from memories_to_md import convert_all, find_memory_inputs
 
-        input_path = base_dir / 'Claude' / 'memories.json'
+        claude_dir = base_dir / 'Claude'
+        inputs = find_memory_inputs(claude_dir)
         memories_output = output_dir / 'memories'
 
-        if not input_path.exists():
-            print_warning(f"Memories file not found: {input_path}")
+        if not inputs:
+            print_warning("No memories export found (Claude/memories/*.json or Claude/memories.json)")
             return False
 
-        memories_output.mkdir(parents=True, exist_ok=True)
-        stats = process_memories(input_path, memories_output)
+        stats = convert_all(inputs, claude_dir, memories_output)
         print_success(f"Extracted {stats['processed']} memory files")
         return True
 
