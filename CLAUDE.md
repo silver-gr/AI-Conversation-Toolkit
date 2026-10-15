@@ -380,7 +380,7 @@ imports/
 | 2026-09-14 | 128 | 0 | 0 | ChatGPT-only export |
 | 2026-10-15 | 96 | 20 | 40 | Extractor content-loss fixes (multimodal/voice, current branch, DR reports, Claude blocks/attachments/summary, Gemini all responses + HTML converter); backfill re-rendered 3,143 existing files |
 
-**Totals (2026-10-15, files kept + `_excluded/`)**: ChatGPT 1,358 + 592, Claude 559 + 139, Gemini 318 + 267
+**Totals (2026-10-15, files kept + `_excluded/`)**: ChatGPT 1,389 + 561, Claude 572 + 126, Gemini 323 + 262 (49 previously excluded files restored after the backfill recovered their content)
 
 ## Import Log Schema
 
