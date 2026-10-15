@@ -369,6 +369,7 @@ def extract_source(
                 incremental=incremental,
                 imported_ids=imported_ids if imported_ids else set(),
                 account=account,
+                skip_imported=True,
             )
             stats['total_in_export'] = result.get('total_activities', result.get('total', 0))
             stats['new_imported'] = result.get('processed', 0)

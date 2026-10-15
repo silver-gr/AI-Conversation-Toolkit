@@ -64,6 +64,8 @@ def extract_query_from_title(title: str) -> str:
         'Υποβλήθηκε το ερώτημα ',  # Greek
         'Submitted query ',         # English
         'Query submitted ',
+        'Prompted ',                # Current English format (2026+)
+        'Imported prompt ',         # Bulk-imported prompts from other platforms
     ]
 
     for prefix in prefix_patterns:
@@ -101,8 +103,13 @@ def parse_activity(entry: dict) -> dict | None:
     attachments = []
 
     # Check for query submission
-    if 'Υποβλήθηκε το ερώτημα' in title or 'Submitted query' in title.lower():
+    if ('Υποβλήθηκε το ερώτημα' in title
+            or 'Submitted query' in title.lower()
+            or title.startswith('Prompted ')
+            or title.startswith('Imported prompt ')):
         activity_type = 'query'
+        if title.startswith('Imported prompt '):
+            activity_type = 'imported_query'
         user_query = extract_query_from_title(title)
 
         # Extract response from safeHtmlItem
@@ -176,7 +183,7 @@ def group_into_conversations(
             # Create new conversation
             current_conv = {
                 'id': ts.isoformat() if ts else 'unknown',
-                'title': activity['query'][:80] if activity['query'] else 'Gemini Session',
+                'title': activity['query'].replace('\n', ' ')[:80].strip() if activity['query'] else 'Gemini Session',
                 'created_at': ts,
                 'updated_at': ts,
                 'activities': [],
@@ -201,7 +208,7 @@ def _escape_yaml_string(s: str) -> str:
     """Escape a string for safe YAML output (double-quoted scalar)."""
     if not s:
         return '""'
-    s = s.replace('\\', '\\\\').replace('"', '\\"')
+    s = s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ')
     return f'"{s}"'
 
 
@@ -368,6 +375,7 @@ def process_gemini_export(
     incremental: bool = False,
     imported_ids: set[str] = None,
     account: str | None = None,
+    skip_imported: bool = False,
 ) -> dict:
     """Process Gemini export and create markdown files.
 
@@ -379,6 +387,7 @@ def process_gemini_export(
         incremental: Skip already imported conversations
         imported_ids: Set of conversation IDs to skip (from previous imports)
         account: Optional account name for multi-account setups
+        skip_imported: Exclude "Imported prompt" entries (bulk-imported from other platforms)
 
     Returns:
         dict with stats including:
@@ -414,6 +423,14 @@ def process_gemini_export(
             activities.append(parsed)
 
     print(f"  Parsed {len(activities)} valid activities")
+
+    # Filter out bulk-imported prompts
+    if skip_imported:
+        before = len(activities)
+        activities = [a for a in activities if a['type'] != 'imported_query']
+        skipped_imported = before - len(activities)
+        if skipped_imported:
+            print(f"  Skipped {skipped_imported} imported prompts (--skip-imported)")
 
     # Group or keep individual
     if no_grouping:
@@ -539,7 +556,7 @@ def process_gemini_export(
 
         for s in summaries:
             date = s['date'][:10] if s['date'] else 'Unknown'
-            title = s['title'][:50]
+            title = s['title'].replace('\n', ' ').replace('|', '-')[:50]
             canvas = '' if s['has_canvas'] else ''
             f.write(f"| {date} | [{title}](conversations/{s['file']}) | {s['activities']} | {s['chars']:,} | {canvas} |\n")
 
@@ -569,6 +586,8 @@ def main():
                        help='Keep each activity separate (no session grouping)')
     parser.add_argument('--incremental', '-i', action='store_true',
                        help='Skip conversations that were already imported')
+    parser.add_argument('--skip-imported', action='store_true',
+                       help='Exclude bulk-imported prompts from other platforms')
     parser.add_argument('--imports-dir', default='imports',
                        help='Directory containing import logs (default: imports)')
 
@@ -606,7 +625,8 @@ def main():
         max_conversations=args.max,
         no_grouping=args.no_grouping,
         incremental=args.incremental,
-        imported_ids=imported_ids
+        imported_ids=imported_ids,
+        skip_imported=args.skip_imported,
     )
 
     return 0
