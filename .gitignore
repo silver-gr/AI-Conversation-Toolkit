@@ -55,3 +55,19 @@ slopo.conf.yaml
 
 # agentmemory MCP runtime state store (written to repo root)
 data/
+
+# Local agent config (Codex hooks call machine-local binaries; mirrors .claude/)
+.codex/
+.agents/
+
+# claude.ai export manifests (single-use download URLs, account UUID)
+manifest-*.json
+
+# Personal project reports and plans (name private conversation topics)
+plans/
+scripts/generate_x3lixi_report.py
+
+# Transcript reviewer data (generated, contains third-party transcript text)
+scripts/transcript_review_batches.json
+scripts/reviewed_transcripts.json
+scripts/review_results_*.json
