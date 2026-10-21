@@ -58,6 +58,12 @@ python3 scripts/backfill_rerender.py --apply     # Overwrite files (back up outp
 # Runnable checks (plain asserts, no pytest needed)
 for t in scripts/tests/test_*.py; do python3 "$t"; done
 
+# Topic research helpers (used by the conversation-research skill; stdlib only)
+python3 scripts/conversation_research.py search sleep υπν insomnia --top 20    # Ranked, accent-insensitive
+python3 scripts/conversation_research.py search adhd δεπυ --from 2025-01-01 --save output/research/.runs/adhd_20261022/candidates.json
+python3 scripts/conversation_research.py excerpt output/claude-full/conversations/<file>.md sleep υπν
+python3 scripts/conversation_research.py verify output/research/.runs/adhd_20261022   # Check lane quotes
+
 # Identify and rename Gemini files with non-descriptive titles
 python3 scripts/gemini_meta_indexer.py              # Dry-run: preview changes
 python3 scripts/gemini_meta_indexer.py --rename      # Apply renames
@@ -269,6 +275,12 @@ After an extractor fix, run `backfill_rerender.py` (dry-run first) so already-im
 - Auto-classifies conversations into topic categories (AI & LLMs, Health, Product Dev, etc.)
 - Generates daily notes, topic MOCs, and a dashboard
 
+**`conversation_research.py`** - Topic research helpers for the `conversation-research` skill (`.claude/skills/conversation-research/`):
+- `search`: case- and accent-insensitive (Greek-aware) word-start term matching; scores each conversation by title, user-message and AI-text matches; flags noisy terms; schedules the best file of every quarter plus top scores into chronological reading lanes; lists derived docs (memories, profile, earlier reports)
+- `excerpt`: a long conversation cut to every user message plus AI passages around matches
+- `verify`: checks reader-lane quotes against their cited files and marks each finding `verified`
+- Reuses `research_index.py` detectors to mark research reports; reports go to `output/research/`, run artifacts to `output/research/.runs/`
+
 ### Export Format Differences
 
 | Source | Structure | Timestamps | Messages |
@@ -335,6 +347,8 @@ output/
 │   ├── chatgpt-full/
 │   ├── claude-full/
 │   └── gemini/
+├── research/                      # conversation-research skill reports (<slug>-YYYY-MM-DD.md)
+│   └── .runs/<slug>_YYYYMMDD/     # candidates.json, lane_*.json (verified findings)
 ├── RESEARCH_INDEX.md
 ├── QUALITY_FILTER_REPORT.md       # Quality filter scoring report
 ├── gemini_files_to_reindex.json   # Gemini meta-indexer manifest
